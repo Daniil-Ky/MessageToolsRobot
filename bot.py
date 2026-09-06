@@ -46,7 +46,7 @@ async def repeat_callback(context: ContextTypes.DEFAULT_TYPE):
         # Удаляем job из очереди
         job.schedule_removal()
         # Удаляем из списка активных для этого чата
-        repeats = context.application.chat_data.get(job.chat_id, {}).get("repeats", {})
+        repeats = context.chat_data.get("repeats", {})
         repeats.pop(job.name, None)
 
 
@@ -89,7 +89,7 @@ async def repeat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    chat_data = context.application.chat_data.setdefault(chat_id, {})
+    chat_data = context.chat_data
     repeats = chat_data.setdefault("repeats", {})
 
     # Уникальное имя job'а
@@ -117,8 +117,7 @@ async def repeat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    chat_data = context.application.chat_data.get(chat_id, {})
+    chat_data = context.chat_data
     repeats = chat_data.get("repeats", {})
 
     if not repeats:
@@ -156,8 +155,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for job in jobs:
         job.schedule_removal()
 
-    chat_data = context.application.chat_data.get(chat_id, {})
-    chat_data.get("repeats", {}).pop(job_name, None)
+    context.chat_data.get("repeats", {}).pop(job_name, None)
 
     await update.message.reply_text(f"Задача #{index} отменена.")
 
