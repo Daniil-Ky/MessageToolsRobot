@@ -269,3 +269,4 @@ async def repeat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = int(args[0])
         interval = int(args[1])
     except ValueError:
+        print("Произошла ошибка ValueError")
