@@ -12,6 +12,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# Настройка логирования
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -19,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Конфигурация окружения
+# Конфигурация окружения (подтягивается из Render автоматически)
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 10000))
@@ -267,5 +268,3 @@ async def repeat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         count = int(args[0])
         interval = int(args[1])
-    except ValueError:
-        print("Произошла ошибка ValueError")
