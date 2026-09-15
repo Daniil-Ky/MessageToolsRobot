@@ -18,6 +18,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Конфигурация окружения
+# ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 10000))
 WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "").rstrip("/")
@@ -39,7 +42,6 @@ async def safe_api_request(endpoint: str, payload: dict) -> dict:
     for attempt in range(5):
         try:
             async with http_session.post(url, json=payload) as resp:
-                # Telegram может вернуть 429 Too Many Requests
                 if resp.status == 429:
                     data = await resp.json()
                     retry_after = data.get("parameters", {}).get("retry_after", 1)
@@ -68,7 +70,6 @@ def retry_on_flood(func):
                 logger.warning("Флуд-контроль Telegram API. Ожидание %s сек.", wait_time)
                 await asyncio.sleep(wait_time)
             except Exception as e:
-                # Пропускаем стандартные ошибки дальше
                 raise e
         return await func(*args, **kwargs)
     return wrapper
@@ -250,8 +251,6 @@ async def repeat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     args = context.args
-    message = update.message
-    reply = message.reply_to_message
 
     if len(args) < 2:
         await send_ephemeral(
