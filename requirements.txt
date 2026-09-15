@@ -1,2 +1,2 @@
-python-telegram-bot[job-queue]==22.8
+python-telegram-bot[job-queue,webhooks]==22.8
 aiohttp==3.10.10
