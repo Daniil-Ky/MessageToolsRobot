@@ -1,4 +1,4 @@
-import os
+<import os
 import asyncio
 import logging
 
@@ -24,9 +24,55 @@ WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "").rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET or 'hook'}"
 
-API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+API_BASE = f"https://telegram.org{BOT_TOKEN}"
 
 http_session: aiohttp.ClientSession | None = None
+
+# ---------------------------------------------------------------------------
+# Вспомогательная функция для безопасных HTTP-запросов к Telegram API
+# ---------------------------------------------------------------------------
+async def safe_api_request(endpoint: str, payload: dict) -> dict:
+    """Выполняет POST-запрос к API Telegram с автоматическим учетом RetryAfter."""
+    assert http_session is not None
+    url = f"{API_BASE}/{endpoint}"
+    
+    for attempt in range(5):
+        try:
+            async with http_session.post(url, json=payload) as resp:
+                # Telegram может вернуть 429 Too Many Requests
+                if resp.status == 429:
+                    data = await resp.json()
+                    retry_after = data.get("parameters", {}).get("retry_after", 1)
+                    logger.warning("Получен статус 429 (aiohttp). Ожидание %s сек.", retry_after)
+                    await asyncio.sleep(retry_after + 0.2)
+                    continue
+                    
+                return await resp.json()
+        except Exception as e:
+            logger.warning("Ошибка сети при запросе к %s: %s. Пробую снова...", endpoint, e)
+            await asyncio.sleep(1)
+            
+    return {"ok": False, "description": "Превышено количество попыток запроса"}
+
+# ---------------------------------------------------------------------------
+# Декоратор для защиты вызовов стандартных методов Telegram от RetryAfter
+# ---------------------------------------------------------------------------
+def retry_on_flood(func):
+    """Декоратор для асинхронных функций, перехватывающий ошибку RetryAfter."""
+    async def wrapper(*args, **kwargs):
+        for attempt in range(5):
+            try:
+                return await func(*args, **kwargs)
+            except RetryAfter as e:
+                wait_time = e.retry_after + 0.2
+                logger.warning("Флуд-контроль Telegram API. Ожидание %s сек.", wait_time)
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                # Пропускаем стандартные ошибки дальше
+                raise e
+        return await func(*args, **kwargs)
+    return wrapper
+
 
 # ---------------------------------------------------------------------------
 # Таблицы соответствий для работы с разными типами медиа
@@ -49,7 +95,6 @@ MEDIA_PARAM_NAMES = {
     "video_note": "video_note",
     "document": "document",
 }
-# Стикеры и видео-кружки в Telegram не поддерживают подписи (caption)
 SUPPORTS_CAPTION = {"photo", "video", "animation", "voice", "document"}
 
 EPHEMERAL_ENDPOINTS = {
@@ -64,7 +109,6 @@ EPHEMERAL_ENDPOINTS = {
 
 
 def extract_media(message):
-    """Возвращает (тип_медиа, file_id) для сообщения, или (None, None)."""
     if not message:
         return None, None
     if message.photo:
@@ -77,19 +121,14 @@ def extract_media(message):
 
 
 def get_media_caption_content(message):
-    """HTML-подпись медиа с сохранением форматирования, либо None."""
     if not message or not message.caption:
         return None
     if message.caption_entities:
         return message.caption_html
-    return message.caption  # позволяет писать HTML-теги вручную
+    return message.caption
 
 
 def get_repeat_text_content(message):
-    """Текст сообщения /repeat, начиная со ВТОРОЙ строки (первая — команда
-    и числа). Если в тексте есть настоящее форматирование Telegram —
-    возвращает HTML-версию (с сохранением жирного/курсива/etc), иначе —
-    исходный текст как есть (это же позволяет писать HTML-теги вручную)."""
     full_text = message.text or ""
     if message.entities:
         full_html = message.text_html
@@ -100,13 +139,13 @@ def get_repeat_text_content(message):
 
 
 # ---------------------------------------------------------------------------
-# Эфемерные сообщения: видны только указанному пользователю.
+# Эфемерные сообщения с защитой от флуда
 # ---------------------------------------------------------------------------
 async def send_ephemeral(context: ContextTypes.DEFAULT_TYPE, chat_id: int, receiver_user_id: int, text: str):
     chat = await context.bot.get_chat(chat_id)
 
     if chat.type == "private":
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        await retry_on_flood(context.bot.send_message)(chat_id=chat_id, text=text, parse_mode="HTML")
         return
 
     payload = {
@@ -117,14 +156,12 @@ async def send_ephemeral(context: ContextTypes.DEFAULT_TYPE, chat_id: int, recei
     }
 
     try:
-        assert http_session is not None
-        async with http_session.post(f"{API_BASE}/sendMessage", json=payload) as resp:
-            data = await resp.json()
+        data = await safe_api_request("sendMessage", payload)
         if not data.get("ok"):
             raise RuntimeError(data.get("description", "unknown error"))
     except Exception as e:
-        logger.warning("Эфемерное сообщение не отправилось (%s), использую обычное", e)
-        sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        logger.warning("Эфемерное сообщение не отправилось (%s), использую обычное с автоудалением", e)
+        sent = await retry_on_flood(context.bot.send_message)(chat_id=chat_id, text=text, parse_mode="HTML")
         context.job_queue.run_once(
             delete_message_callback, when=60,
             data={"chat_id": chat_id, "message_id": sent.message_id},
@@ -146,7 +183,7 @@ async def send_ephemeral_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
 
     if chat.type == "private":
         method = getattr(context.bot, method_name)
-        await method(**build_kwargs(chat_id))
+        await retry_on_flood(method)(**build_kwargs(chat_id))
         return
 
     payload = {
@@ -159,15 +196,13 @@ async def send_ephemeral_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         payload["parse_mode"] = "HTML"
 
     try:
-        assert http_session is not None
-        async with http_session.post(f"{API_BASE}/{EPHEMERAL_ENDPOINTS[media_type]}", json=payload) as resp:
-            data = await resp.json()
+        data = await safe_api_request(EPHEMERAL_ENDPOINTS[media_type], payload)
         if not data.get("ok"):
             raise RuntimeError(data.get("description", "unknown error"))
     except Exception as e:
         logger.warning("Эфемерное медиа не отправилось (%s), использую обычное", e)
         method = getattr(context.bot, method_name)
-        sent = await method(**build_kwargs(chat_id))
+        sent = await retry_on_flood(method)(**build_kwargs(chat_id))
         context.job_queue.run_once(
             delete_message_callback, when=60,
             data={"chat_id": chat_id, "message_id": sent.message_id},
@@ -177,27 +212,30 @@ async def send_ephemeral_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
 async def delete_message_callback(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     try:
-        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+        await retry_on_flood(context.bot.delete_message)(chat_id=data["chat_id"], message_id=data["message_id"])
     except Exception as e:
         logger.warning("Не удалось удалить сообщение: %s", e)
 
 
 # ---------------------------------------------------------------------------
-# Логика повторяющихся сообщений (текст или медиа)
+# Логика повторяющихся сообщений с защитой от флуда
 # ---------------------------------------------------------------------------
 async def repeat_callback(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     data = job.data
 
-    if data["mode"] == "media":
-        method = getattr(context.bot, MEDIA_SEND_METHODS[data["media_type"]])
-        kwargs = {"chat_id": job.chat_id, MEDIA_PARAM_NAMES[data["media_type"]]: data["file_id"]}
-        if data.get("caption") and data["media_type"] in SUPPORTS_CAPTION:
-            kwargs["caption"] = data["caption"]
-            kwargs["parse_mode"] = "HTML"
-        await method(**kwargs)
-    else:
-        await context.bot.send_message(chat_id=job.chat_id, text=data["content"], parse_mode="HTML")
+    try:
+        if data["mode"] == "media":
+            method = getattr(context.bot, MEDIA_SEND_METHODS[data["media_type"]])
+            kwargs = {"chat_id": job.chat_id, MEDIA_PARAM_NAMES[data["media_type"]]: data["file_id"]}
+            if data.get("caption") and data["media_type"] in SUPPORTS_CAPTION:
+                kwargs["caption"] = data["caption"]
+                kwargs["parse_mode"] = "HTML"
+            await retry_on_flood(method)(**kwargs)
+        else:
+            await retry_on_flood(context.bot.send_message)(chat_id=job.chat_id, text=data["content"], parse_mode="HTML")
+    except Exception as e:
+        logger.error("Критическая ошибка при отправке повтора в job %s: %s", job.name, e)
 
     data["remaining"] -= 1
     data["sent"] += 1
@@ -221,12 +259,9 @@ async def repeat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>Для текста:</b>\n"
             "/repeat количество интервал_в_секундах\n"
             "Текст на следующей строке (можно с форматированием)\n\n"
-            "<b>Для медиа</b> (фото/видео/стикер/голосовое/кружок/файл):\n"
+            "<b>Для медиа</b>:\n"
             "ответь на медиа-сообщение командой:\n"
-            "/repeat количество интервал_в_секундах\n\n"
-            "<b>Пример:</b>\n"
-            "/repeat 10 86400\n"
-            "<b>Ежедневный бонус!</b> Забери его 🎁",
+            "/repeat количество интервал_в_секундах",
         )
         return
 
@@ -234,45 +269,7 @@ async def repeat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = int(args[0])
         interval = int(args[1])
     except ValueError:
-        await send_ephemeral(context, chat_id, user_id, "Количество и интервал должны быть числами.")
-        return
-
-    if count <= 0:
-        await send_ephemeral(context, chat_id, user_id, "Количество повторений должно быть больше 0.")
-        return
-    if interval < 5:
-        await send_ephemeral(context, chat_id, user_id, "Интервал слишком маленький, укажи хотя бы 5 секунд.")
-        return
-
-    media_type, file_id = extract_media(reply)
-
-    if media_type:
-        override_caption = None
-        if message.text and "\n" in message.text:
-            override_caption = get_repeat_text_content(message).strip() or None
-        caption = override_caption or get_media_caption_content(reply)
-
-        job_data = {
-            "mode": "media", "media_type": media_type, "file_id": file_id,
-            "caption": caption, "remaining": count, "sent": 0, "interval": interval,
-        }
-        preview = f"[{media_type}]"
-    else:
-        content = get_repeat_text_content(message)
-        if not content.strip():
-            await send_ephemeral(
-                context, chat_id, user_id,
-                "Не найден текст на второй строке. Формат:\n"
-                "/repeat количество интервал\nТекст сообщения\n\n"
-                "Либо ответь на фото/видео/стикер той же командой, чтобы "
-                "повторять медиа.",
-            )
-            return
-        job_data = {"mode": "text", "content": content, "remaining": count, "sent": 0, "interval": interval}
-        preview = content if len(content) <= 40 else content[:40] + "..."
-
-    chat_data = context.chat_data
-    repeats = chat_data.setdefault("repeats", {})
+   repeats = chat_data.setdefault("repeats", {})
     job_index = chat_data.get("next_index", 1)
     chat_data["next_index"] = job_index + 1
     job_name = f"repeat_{chat_id}_{job_index}"
