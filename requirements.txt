@@ -1,2 +1,2 @@
-python-telegram-bot[job-queue]==21.4
-Flask==3.0.3
+python-telegram-bot[job-queue]==22.8
+aiohttp==3.10.10
