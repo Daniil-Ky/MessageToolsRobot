@@ -268,3 +268,5 @@ async def repeat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         count = int(args[0])
         interval = int(args[1])
+    except (IndexError, ValueError):
+        interval = 60  # значение по умолчанию, если аргумент не передан или это не число
