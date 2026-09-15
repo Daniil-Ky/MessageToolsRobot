@@ -1,8 +1,10 @@
 import os
+import asyncio
 import logging
 
 import aiohttp
 from telegram import Update
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -232,13 +234,32 @@ async def post_init(application: Application):
         raise RuntimeError("Не задан WEBHOOK_HOST (переменная окружения)")
 
     webhook_url = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-    await application.bot.set_webhook(
-        url=webhook_url,
-        secret_token=WEBHOOK_SECRET or None,
-    )
+    await set_webhook_with_retry(application, webhook_url)
     logger.info("Webhook установлен: %s", webhook_url)
 
     await register_ephemeral_commands()
+
+
+async def set_webhook_with_retry(application: Application, webhook_url: str, attempts: int = 5):
+    """Telegram может временно ограничивать частые вызовы (RetryAfter) —
+    например, если сервис несколько раз подряд перезапускался. Ждём
+    указанное время и пробуем снова, вместо того чтобы падать целиком."""
+    for attempt in range(1, attempts + 1):
+        try:
+            await application.bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET or None,
+            )
+            return
+        except RetryAfter as e:
+            wait = e.retry_after + 1
+            logger.warning(
+                "Telegram ограничил частоту запросов, жду %s сек. (попытка %s/%s)",
+                wait, attempt, attempts,
+            )
+            await asyncio.sleep(wait)
+    # Последняя попытка без перехвата — если и она не пройдёт, лог покажет причину
+    await application.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET or None)
 
 
 async def register_ephemeral_commands():
