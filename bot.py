@@ -538,6 +538,22 @@ async def post_shutdown(application: Application):
         await http_session.close()
 
 
+def build_application() -> Application:
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("repeat", repeat_command))
+    application.add_handler(CommandHandler("list", list_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("whisper", whisper_command))
+    return application
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задан BOT_TOKEN (переменная окружения)")
@@ -552,29 +568,18 @@ def main():
     #
     # Простое и надёжное решение — сделать паузу перед стартом каждый раз,
     # без исключений. Это разрывает цикл мгновенных перезапусков.
-    startup_delay = int(os.environ.get("STARTUP_DELAY_SECONDS", "20"))
+    startup_delay = int(os.environ.get("STARTUP_DELAY_SECONDS", "10"))
     logger.info("Жду %s сек. перед стартом (защита от цикла флуд-контроля)", startup_delay)
     time.sleep(startup_delay)
 
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("repeat", repeat_command))
-    application.add_handler(CommandHandler("list", list_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CommandHandler("whisper", whisper_command))
-
     logger.info("Бот запускается через webhook")
 
-    max_attempts = 3
+    max_attempts = 8
     for attempt in range(1, max_attempts + 1):
         try:
+            # Создаём приложение заново на каждой попытке — переиспользовать
+            # тот же объект после неудачного run_webhook небезопасно.
+            application = build_application()
             application.run_webhook(
                 listen="0.0.0.0",
                 port=PORT,
@@ -583,14 +588,21 @@ def main():
             )
             break
         except RetryAfter as e:
-            wait = e.retry_after + 10
+            wait = e.retry_after + 15
             logger.warning(
                 "Флуд-контроль Telegram при старте, жду %s сек. (попытка %s/%s)",
                 wait, attempt, max_attempts,
             )
             time.sleep(wait)
+        except Exception as e:
+            wait = 15
+            logger.warning(
+                "Ошибка при старте (%s: %s), жду %s сек. (попытка %s/%s)",
+                type(e).__name__, e, wait, attempt, max_attempts,
+            )
+            time.sleep(wait)
     else:
-        logger.critical("Не удалось запустить бота после %s попыток из-за флуд-контроля", max_attempts)
+        logger.critical("Не удалось запустить бота после %s попыток", max_attempts)
 
 
 if __name__ == "__main__":
