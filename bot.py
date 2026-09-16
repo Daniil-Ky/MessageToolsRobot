@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 10000))
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "").rstrip("/")
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET or 'hook'}"
 
