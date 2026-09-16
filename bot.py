@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import logging
 
@@ -471,8 +472,14 @@ async def post_init(application: Application):
     global http_session
     http_session = aiohttp.ClientSession()
 
+    logger.info("WEBHOOK_HOST из окружения (в кавычках, чтобы видеть пробелы/переносы): %r", WEBHOOK_HOST)
+
     if not WEBHOOK_HOST:
         raise RuntimeError("Не задан WEBHOOK_HOST (переменная окружения)")
+    if not WEBHOOK_HOST.startswith("https://"):
+        raise RuntimeError(
+            f"WEBHOOK_HOST должен начинаться с https:// , сейчас: {WEBHOOK_HOST!r}"
+        )
 
     webhook_url = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
     await set_webhook_with_retry(application, webhook_url)
@@ -535,6 +542,20 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задан BOT_TOKEN (переменная окружения)")
 
+    # Если процесс до этого падал и Render мгновенно его перезапустил (это
+    # видно по коротким промежуткам между "Exited" и "Running" в логах),
+    # каждый такой рестарт снова стучится к Telegram ещё ДО того, как
+    # успевает сработать обработка ошибок внутри кода — это происходит на
+    # уровне самой библиотеки при её внутренней инициализации. В итоге
+    # временное ограничение частоты запросов (флуд-контроль) от Telegram
+    # никогда не успевает "остыть", и процесс падает в цикле.
+    #
+    # Простое и надёжное решение — сделать паузу перед стартом каждый раз,
+    # без исключений. Это разрывает цикл мгновенных перезапусков.
+    startup_delay = int(os.environ.get("STARTUP_DELAY_SECONDS", "20"))
+    logger.info("Жду %s сек. перед стартом (защита от цикла флуд-контроля)", startup_delay)
+    time.sleep(startup_delay)
+
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -550,12 +571,26 @@ def main():
     application.add_handler(CommandHandler("whisper", whisper_command))
 
     logger.info("Бот запускается через webhook")
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        secret_token=WEBHOOK_SECRET or None,
-    )
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=WEBHOOK_PATH,
+                secret_token=WEBHOOK_SECRET or None,
+            )
+            break
+        except RetryAfter as e:
+            wait = e.retry_after + 10
+            logger.warning(
+                "Флуд-контроль Telegram при старте, жду %s сек. (попытка %s/%s)",
+                wait, attempt, max_attempts,
+            )
+            time.sleep(wait)
+    else:
+        logger.critical("Не удалось запустить бота после %s попыток из-за флуд-контроля", max_attempts)
 
 
 if __name__ == "__main__":
