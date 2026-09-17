@@ -475,23 +475,43 @@ async def post_init(application: Application):
 
 
 async def register_ephemeral_commands():
-    """Регистрирует команды с флагом is_ephemeral — тогда и сама команда,
-    которую вводит пользователь в группе, будет видна только ему."""
-    commands = [
-        {"command": "start", "description": "Начало работы с ботом", "is_ephemeral": True},
-        {"command": "repeat", "description": "Запланировать повторение текста/медиа", "is_ephemeral": True},
-        {"command": "list", "description": "Показать активные повторения", "is_ephemeral": True},
-        {"command": "cancel", "description": "Отменить повторение по номеру", "is_ephemeral": True},
-        {"command": "whisper", "description": "Приватное сообщение человеку", "is_ephemeral": True},
+    """Регистрирует команды раздельно для личных чатов и для групп:
+    - В личных чатах эфемерность не нужна (там и так видно только
+      пользователю), а Telegram, судя по всему, не показывает команды
+      с is_ephemeral в меню личных чатов вообще — поэтому там регистрируем
+      обычный (без флага) список, чтобы меню отображалось.
+    - В группах регистрируем с is_ephemeral: true — тогда и сама команда,
+      которую вводит пользователь, видна только ему."""
+    base_commands = [
+        {"command": "start", "description": "Начало работы с ботом"},
+        {"command": "repeat", "description": "Запланировать повторение текста/медиа"},
+        {"command": "list", "description": "Показать активные повторения"},
+        {"command": "cancel", "description": "Отменить повторение по номеру"},
+        {"command": "whisper", "description": "Приватное сообщение человеку"},
     ]
-    data = await safe_api_request("setMyCommands", {"commands": commands})
-    if data.get("ok"):
-        logger.info("Эфемерные команды зарегистрированы")
+    group_commands = [{**cmd, "is_ephemeral": True} for cmd in base_commands]
+
+    private_result = await safe_api_request(
+        "setMyCommands",
+        {"commands": base_commands, "scope": {"type": "all_private_chats"}},
+    )
+    group_result = await safe_api_request(
+        "setMyCommands",
+        {"commands": group_commands, "scope": {"type": "all_group_chats"}},
+    )
+
+    if private_result.get("ok"):
+        logger.info("Команды для личных чатов зарегистрированы")
+    else:
+        logger.warning("Не удалось зарегистрировать команды для личных чатов (%s)", private_result.get("description"))
+
+    if group_result.get("ok"):
+        logger.info("Эфемерные команды для групп зарегистрированы")
     else:
         logger.warning(
-            "Не удалось зарегистрировать эфемерные команды (%s) — команды "
-            "останутся видимыми всем в группе, но ответы бота всё равно "
-            "будут эфемерными", data.get("description"),
+            "Не удалось зарегистрировать эфемерные команды для групп (%s) — "
+            "команды останутся видимыми всем в группе, но ответы бота всё "
+            "равно будут эфемерными", group_result.get("description"),
         )
 
 
