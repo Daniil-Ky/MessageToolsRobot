@@ -466,6 +466,35 @@ async def whisper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Глобальный обработчик ошибок: если при обработке любой команды что-то
+# сломалось, автору команды приходит понятное эфемерное сообщение об этом
+# (а не полная тишина, когда разобраться может только тот, у кого есть
+# доступ к логам Render).
+# ---------------------------------------------------------------------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Необработанная ошибка при обработке апдейта: %s", context.error, exc_info=context.error)
+
+    if not isinstance(update, Update):
+        return
+    if not update.effective_chat or not update.effective_user:
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    try:
+        await send_ephemeral(
+            context, chat_id, user_id,
+            "⚠️ Не получилось обработать команду — что-то пошло не так на "
+            "стороне бота.\n\nПроверьте формат команды (/start покажет "
+            "подсказку) и попробуйте ещё раз. Если ошибка повторится — "
+            "сообщите об этом администратору бота.",
+        )
+    except Exception as e:
+        logger.error("Не удалось отправить сообщение об ошибке пользователю: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Запуск через webhook
 # ---------------------------------------------------------------------------
 async def post_init(application: Application):
@@ -533,6 +562,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("whisper", whisper_command))
+    application.add_error_handler(error_handler)
     return application
 
 
