@@ -2,15 +2,24 @@ import os
 import time
 import asyncio
 import logging
+import itertools
 
 import aiohttp
-from telegram import Update
+from telegram import (
+    Update,
+    KeyboardButton,
+    KeyboardButtonRequestUsers,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 logging.basicConfig(
@@ -18,6 +27,10 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Хранилище ожидающих запросов /convene: request_id -> {chat_id, sender_id, content}
+pending_convene_requests: dict[int, dict] = {}
+_convene_request_counter = itertools.count(1)
 
 # ---------------------------------------------------------------------------
 # Конфигурация окружения (подтягивается из Render автоматически)
@@ -150,11 +163,14 @@ def get_repeat_text_content(message):
 # ---------------------------------------------------------------------------
 # Эфемерные сообщения: видны только указанному пользователю.
 # ---------------------------------------------------------------------------
-async def send_ephemeral(context: ContextTypes.DEFAULT_TYPE, chat_id: int, receiver_user_id: int, text: str):
+async def send_ephemeral(context: ContextTypes.DEFAULT_TYPE, chat_id: int, receiver_user_id: int, text: str,
+                          reply_markup=None):
     chat = await context.bot.get_chat(chat_id)
 
     if chat.type == "private":
-        await retry_on_flood(context.bot.send_message)(chat_id=chat_id, text=text, parse_mode="HTML")
+        await retry_on_flood(context.bot.send_message)(
+            chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup
+        )
         return
 
     payload = {
@@ -163,12 +179,16 @@ async def send_ephemeral(context: ContextTypes.DEFAULT_TYPE, chat_id: int, recei
         "parse_mode": "HTML",
         "ephemeral_message_parameters": {"receiver_user_id": receiver_user_id},
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup.to_dict()
 
     data = await safe_api_request("sendMessage", payload)
     if not data.get("ok"):
         logger.warning("Эфемерное сообщение не отправилось (%s), использую обычное с автоудалением",
                         data.get("description"))
-        sent = await retry_on_flood(context.bot.send_message)(chat_id=chat_id, text=text, parse_mode="HTML")
+        sent = await retry_on_flood(context.bot.send_message)(
+            chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup
+        )
         context.job_queue.run_once(
             delete_message_callback, when=60,
             data={"chat_id": chat_id, "message_id": sent.message_id},
@@ -389,15 +409,44 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я отправляю повторяющиеся сообщения (текст, фото, видео, "
         "стикеры, голосовые, кружки, файлы) и умею шептать личные "
         "сообщения одному человеку.\n\n"
+        f"Ваш Telegram ID: <code>{user_id}</code> (дайте его тому, кто "
+        "хочет прислать вам /whisper по ID)\n\n"
         "<b>Команды:</b>\n"
         "/repeat количество интервал\nтекст на след. строке\n"
         "(или ответь на медиа той же командой)\n\n"
         "/list — активные повторения\n"
         "/cancel номер — отменить повторение\n\n"
-        "/whisper @username текст — приватное сообщение\n"
-        "/whisper текст (ответом на чьё-то сообщение) — то же самое\n"
-        "(можно приложить фото/видео/стикер вместо текста)",
+        "/whisper ID текст — приватное сообщение (самый надёжный способ, "
+        "ID можно узнать через /start у получателя)\n"
+        "/whisper @username текст — то же самое, но не всегда находит\n"
+        "/whisper текст (ответом на чьё-то сообщение) — тоже всегда работает\n"
+        "(можно приложить фото/видео/стикер вместо текста)\n\n"
+        "/id — узнать свой ID, или ID другого человека (ответом на его "
+        "сообщение)\n\n"
+        "/convene\nтекст на след. строке — публичное сообщение с "
+        "упоминанием нескольких выбранных людей (жми «Добавить получателей» "
+        "сколько угодно раз, до 10 за раз, затем «Отправить»)",
     )
+
+
+# ---------------------------------------------------------------------------
+# /id — узнать свой Telegram ID или ID другого человека (по reply)
+# ---------------------------------------------------------------------------
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sender_id = update.effective_user.id
+    message = update.message
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        # ID другого человека — видно только тому, кто спросил
+        target = message.reply_to_message.from_user
+        safe_name = target.full_name.replace("<", "&lt;").replace(">", "&gt;")
+        text = f"{safe_name}: <code>{target.id}</code>"
+        await send_ephemeral(context, chat_id, sender_id, text)
+    else:
+        # Свой собственный ID — можно показывать открыто, видно всем
+        text = f"Ваш Telegram ID: <code>{sender_id}</code>"
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +467,17 @@ async def whisper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_user_id = target.id
         target_label = target.full_name
 
+    elif args and args[0].isdigit():
+        target_user_id = int(args[0])
+        remaining_args = args[1:]
+        # Пытаемся узнать имя для красоты сообщения — но это не обязательно
+        # для самой отправки, ID уже достаточно.
+        try:
+            member = await context.bot.get_chat_member(chat_id, target_user_id)
+            target_label = member.user.full_name
+        except Exception:
+            target_label = f"ID {target_user_id}"
+
     elif args and args[0].startswith("@"):
         username = args[0][1:]
         try:
@@ -431,8 +491,11 @@ async def whisper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Не удалось найти пользователя @{username}.\n"
                 "Либо у него нет публичного юзернейма, либо бот ещё не "
                 "видел его в этом чате.\n\n"
-                "Альтернатива: ответь (reply) на его сообщение командой "
-                "/whisper текст.",
+                "Альтернатива 1: ответь (reply) на его сообщение командой "
+                "/whisper текст.\n"
+                "Альтернатива 2: узнай его числовой Telegram ID (например, "
+                "он может прислать боту /start и увидеть свой ID) и "
+                "используй /whisper ID текст — это работает всегда.",
             )
             return
     else:
@@ -440,6 +503,7 @@ async def whisper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context, chat_id, sender_id,
             "Формат команды:\n"
             "/whisper @username текст\n"
+            "/whisper ID текст (самый надёжный способ)\n"
             "или ответь (reply) на сообщение человека:\n"
             "/whisper текст\n\n"
             "Можно вместо текста (или вместе с ним) приложить фото, "
@@ -463,6 +527,126 @@ async def whisper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context, chat_id, sender_id,
             f"Отправлено пользователю {target_label} (видно только ему).",
         )
+
+
+# ---------------------------------------------------------------------------
+# /convene — открытое сообщение с упоминанием нескольких выбранных людей
+# (в отличие от /whisper — это ПУБЛИЧНОЕ сообщение, видно всем в чате,
+# просто с уведомлением-упоминанием конкретных людей).
+# ---------------------------------------------------------------------------
+CONVENE_ADD_BUTTON = "👥 Добавить получателей"
+CONVENE_DONE_BUTTON = "✅ Отправить"
+
+# (chat_id, sender_id) -> request_id текущей открытой сессии /convene
+active_convene_session: dict[tuple, int] = {}
+
+
+def build_convene_keyboard(request_id: int) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(
+                text=CONVENE_ADD_BUTTON,
+                request_users=KeyboardButtonRequestUsers(
+                    request_id=request_id,
+                    max_quantity=10,
+                    request_name=True,
+                    request_username=True,
+                ),
+            )],
+            [KeyboardButton(text=CONVENE_DONE_BUTTON)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def convene_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sender_id = update.effective_user.id
+    message = update.message
+
+    content = get_repeat_text_content(message)
+    if not content.strip():
+        await send_ephemeral(
+            context, chat_id, sender_id,
+            "Формат команды:\n/convene\nТекст сообщения на второй строке "
+            "(можно с форматированием и эмодзи)\n\n"
+            "После отправки появится кнопка «Добавить получателей» — "
+            "жми её сколько угодно раз (по 10 человек за раз), чтобы "
+            "накопить список, а затем нажми «Отправить».",
+        )
+        return
+
+    request_id = next(_convene_request_counter)
+    pending_convene_requests[request_id] = {
+        "chat_id": chat_id,
+        "sender_id": sender_id,
+        "content": content,
+        "collected": {},  # user_id -> объект пользователя
+    }
+    active_convene_session[(chat_id, sender_id)] = request_id
+
+    await send_ephemeral(
+        context, chat_id, sender_id,
+        "Нажимай «Добавить получателей» столько раз, сколько нужно "
+        "(до 10 человек за раз). Когда выберешь всех — жми «Отправить».",
+        reply_markup=build_convene_keyboard(request_id),
+    )
+
+
+async def on_users_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    shared = message.users_shared
+    request_id = shared.request_id
+    chat_id = update.effective_chat.id
+    sender_id = message.from_user.id
+
+    data = pending_convene_requests.get(request_id)
+    if not data:
+        await send_ephemeral(
+            context, chat_id, sender_id,
+            "Эта сессия выбора устарела. Начните заново: /convene",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    for u in shared.users:
+        data["collected"][u.user_id] = u
+
+    count = len(data["collected"])
+    await send_ephemeral(
+        context, chat_id, sender_id,
+        f"Добавлено. Сейчас выбрано: {count} чел.\n"
+        "Можно добавить ещё, либо нажать «Отправить».",
+        reply_markup=build_convene_keyboard(request_id),
+    )
+
+
+async def on_convene_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    chat_id = update.effective_chat.id
+    sender_id = message.from_user.id
+
+    request_id = active_convene_session.pop((chat_id, sender_id), None)
+    if request_id is None:
+        return  # нажатие без активной сессии — просто игнорируем
+
+    data = pending_convene_requests.pop(request_id, None)
+    await send_ephemeral(context, chat_id, sender_id, "Готово.", reply_markup=ReplyKeyboardRemove())
+
+    if not data or not data["collected"]:
+        await send_ephemeral(context, chat_id, sender_id, "Никого не выбрали, сообщение не отправлено.")
+        return
+
+    mentions = []
+    for u in data["collected"].values():
+        name = u.first_name or (f"@{u.username}" if u.username else f"пользователь {u.user_id}")
+        safe_name = name.replace("<", "&lt;").replace(">", "&gt;")
+        mentions.append(f'<a href="tg://user?id={u.user_id}">{safe_name}</a>')
+
+    text = f"{data['content']}\n\n" + " ".join(mentions)
+
+    # А вот это — единственное сообщение, которое видно всем в чате
+    await context.bot.send_message(chat_id=data["chat_id"], text=text, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
@@ -517,8 +701,18 @@ async def register_ephemeral_commands():
         {"command": "list", "description": "Показать активные повторения"},
         {"command": "cancel", "description": "Отменить повторение по номеру"},
         {"command": "whisper", "description": "Приватное сообщение человеку"},
+        {"command": "id", "description": "Узнать свой ID или ID другого (по ответу)"},
+        {"command": "convene", "description": "Позвать нескольких людей сообщением"},
     ]
-    group_commands = [{**cmd, "is_ephemeral": True} for cmd in base_commands]
+    # /id не делаем эфемерной командой: без ответа она показывает ID
+    # открыто всем, так что скрывать её ввод было бы непоследовательно.
+    # /convene, наоборот, эфемерна — сам процесс выбора людей скрыт,
+    # видно только итоговое сообщение с упоминаниями.
+    ephemeral_names = {"start", "repeat", "list", "cancel", "whisper", "convene"}
+    group_commands = [
+        {**cmd, "is_ephemeral": True} if cmd["command"] in ephemeral_names else cmd
+        for cmd in base_commands
+    ]
 
     private_result = await safe_api_request(
         "setMyCommands",
@@ -562,6 +756,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("whisper", whisper_command))
+    application.add_handler(CommandHandler("id", id_command))
+    application.add_handler(CommandHandler("convene", convene_command))
+    application.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, on_users_shared))
+    application.add_handler(MessageHandler(filters.Text([CONVENE_DONE_BUTTON]), on_convene_done_button))
     application.add_error_handler(error_handler)
     return application
 
