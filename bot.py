@@ -3,6 +3,7 @@ import time
 import asyncio
 import logging
 import itertools
+import random
 
 import aiohttp
 from telegram import (
@@ -29,7 +30,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Хранилище ожидающих запросов /convene: request_id -> {chat_id, sender_id, content}
-pending_convene_requests: dict[int, dict] = {}
 _convene_request_counter = itertools.count(1)
 
 # ---------------------------------------------------------------------------
@@ -158,6 +158,29 @@ def get_repeat_text_content(message):
         return html_after
     _, _, plain_after = full_text.partition("\n")
     return plain_after
+
+
+def get_command_argument_content(message):
+    """Текст после команды (например, /convene текст) — команда отделяется
+    по первому пробелу ИЛИ переносу строки, что бы ни встретилось раньше.
+    Специально сделано так, чтобы можно было писать всё одной строкой:
+    Telegram, судя по всему, скрывает эфемерную команду только пока в
+    сообщении нет переноса строки — с переносом команда становится видна
+    всем. Форматирование (жирный, курсив, HTML-теги) сохраняется так же,
+    как в get_repeat_text_content."""
+    full_text = message.text or ""
+    parts = full_text.split(None, 1)
+    if len(parts) < 2:
+        return ""
+    command_token = parts[0]
+
+    if message.entities:
+        full_html = message.text_html
+        idx = full_html.find(command_token)
+        if idx != -1:
+            return full_html[idx + len(command_token):].lstrip()
+
+    return parts[1]
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +446,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(можно приложить фото/видео/стикер вместо текста)\n\n"
         "/id — узнать свой ID, или ID другого человека (ответом на его "
         "сообщение)\n\n"
-        "/convene\nтекст на след. строке — публичное сообщение с "
-        "упоминанием нескольких выбранных людей (жми «Добавить получателей» "
-        "сколько угодно раз, до 10 за раз, затем «Отправить»)",
+        "/convene Текст — здесь, в личке, выбери получателей (жми "
+        "«Добавить получателей» сколько угодно раз, до 10 за раз, затем "
+        "«Готово»), затем зайди в нужную группу и напиши там /send — "
+        "сообщение с упоминаниями уйдёт туда.",
     )
 
 
@@ -438,15 +462,14 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
     if message.reply_to_message and message.reply_to_message.from_user:
-        # ID другого человека — видно только тому, кто спросил
         target = message.reply_to_message.from_user
         safe_name = target.full_name.replace("<", "&lt;").replace(">", "&gt;")
         text = f"{safe_name}: <code>{target.id}</code>"
-        await send_ephemeral(context, chat_id, sender_id, text)
     else:
-        # Свой собственный ID — можно показывать открыто, видно всем
         text = f"Ваш Telegram ID: <code>{sender_id}</code>"
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
+    # Эфемерно в любом случае — видно только тому, кто спросил
+    await send_ephemeral(context, chat_id, sender_id, text)
 
 
 # ---------------------------------------------------------------------------
@@ -530,15 +553,36 @@ async def whisper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# /convene — открытое сообщение с упоминанием нескольких выбранных людей
-# (в отличие от /whisper — это ПУБЛИЧНОЕ сообщение, видно всем в чате,
-# просто с уведомлением-упоминанием конкретных людей).
+# /convene (в личке с ботом) — выбираешь получателей, /send (в группе) —
+# отправляет туда готовое сообщение с упоминаниями.
+# Разделено на два места потому, что Telegram разрешает кнопку выбора
+# людей ТОЛЬКО в личных чатах — в группах она технически не работает.
 # ---------------------------------------------------------------------------
 CONVENE_ADD_BUTTON = "👥 Добавить получателей"
-CONVENE_DONE_BUTTON = "✅ Отправить"
+CONVENE_DONE_BUTTON = "✅ Готово"
+CONVENE_DRAFT_TTL_SECONDS = 30 * 60  # черновик "протухает" через 30 минут
 
-# (chat_id, sender_id) -> request_id текущей открытой сессии /convene
-active_convene_session: dict[tuple, int] = {}
+# Пул эмодзи для упоминаний в /send — стараемся не повторять их в пределах
+# одного сообщения, пока хватает уникальных вариантов.
+MENTION_EMOJI_POOL = [
+    "😎", "🔥", "✨", "🎯", "🚀", "🌟", "💥", "🎉", "🦄", "🐉",
+    "🍀", "⚡", "🌈", "🎈", "🎮", "🍕", "🎲", "🛸", "🦊", "🐺",
+    "🌙", "☀️", "🍉", "🎃", "🦁", "🐯", "🐸", "🦖", "🍩", "🎁",
+]
+
+
+def pick_mention_emojis(count: int) -> list[str]:
+    pool = MENTION_EMOJI_POOL.copy()
+    random.shuffle(pool)
+    if count <= len(pool):
+        return pool[:count]
+    # Если людей больше, чем эмодзи в пуле — добираем со случайными
+    # повторами поверх уже перемешанного полного набора.
+    extra = [random.choice(MENTION_EMOJI_POOL) for _ in range(count - len(pool))]
+    return pool + extra
+
+# user_id -> {"content", "collected", "request_id", "created_at"}
+pending_convene_drafts: dict[int, dict] = {}
 
 
 def build_convene_keyboard(request_id: int) -> ReplyKeyboardMarkup:
@@ -560,35 +604,44 @@ def build_convene_keyboard(request_id: int) -> ReplyKeyboardMarkup:
 
 
 async def convene_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat = update.effective_chat
     sender_id = update.effective_user.id
     message = update.message
 
-    content = get_repeat_text_content(message)
-    if not content.strip():
+    if chat.type != "private":
         await send_ephemeral(
-            context, chat_id, sender_id,
-            "Формат команды:\n/convene\nТекст сообщения на второй строке "
-            "(можно с форматированием и эмодзи)\n\n"
-            "После отправки появится кнопка «Добавить получателей» — "
-            "жми её сколько угодно раз (по 10 человек за раз), чтобы "
-            "накопить список, а затем нажми «Отправить».",
+            context, chat.id, sender_id,
+            "Эту команду нужно использовать в личных сообщениях со мной "
+            "— Telegram не разрешает выбирать людей кнопкой прямо в "
+            "группе.\n\n"
+            "Напишите мне в личку:\n/convene Текст сообщения\n\n"
+            "А когда список получателей будет готов — вернитесь в нужную "
+            "группу и напишите там /send.",
+        )
+        return
+
+    content = get_command_argument_content(message)
+    if not content.strip():
+        await message.reply_text(
+            "Формат: /convene Текст сообщения (одной строкой, можно с "
+            "форматированием и эмодзи).\n\n"
+            "После этого жми «Добавить получателей» сколько угодно раз "
+            "(до 10 за раз), а затем «Готово». После этого зайди в нужную "
+            "группу и напиши там /send — сообщение уйдёт туда."
         )
         return
 
     request_id = next(_convene_request_counter)
-    pending_convene_requests[request_id] = {
-        "chat_id": chat_id,
-        "sender_id": sender_id,
+    pending_convene_drafts[sender_id] = {
         "content": content,
-        "collected": {},  # user_id -> объект пользователя
+        "collected": {},
+        "request_id": request_id,
+        "created_at": time.time(),
     }
-    active_convene_session[(chat_id, sender_id)] = request_id
 
-    await send_ephemeral(
-        context, chat_id, sender_id,
+    await message.reply_text(
         "Нажимай «Добавить получателей» столько раз, сколько нужно "
-        "(до 10 человек за раз). Когда выберешь всех — жми «Отправить».",
+        "(до 10 человек за раз). Когда выберешь всех — жми «Готово».",
         reply_markup=build_convene_keyboard(request_id),
     )
 
@@ -596,15 +649,12 @@ async def convene_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_users_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     shared = message.users_shared
-    request_id = shared.request_id
-    chat_id = update.effective_chat.id
     sender_id = message.from_user.id
 
-    data = pending_convene_requests.get(request_id)
-    if not data:
-        await send_ephemeral(
-            context, chat_id, sender_id,
-            "Эта сессия выбора устарела. Начните заново: /convene",
+    data = pending_convene_drafts.get(sender_id)
+    if not data or data["request_id"] != shared.request_id:
+        await message.reply_text(
+            "Эта сессия устарела. Начните заново: /convene Текст сообщения",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
@@ -613,40 +663,73 @@ async def on_users_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["collected"][u.user_id] = u
 
     count = len(data["collected"])
-    await send_ephemeral(
-        context, chat_id, sender_id,
+    await message.reply_text(
         f"Добавлено. Сейчас выбрано: {count} чел.\n"
-        "Можно добавить ещё, либо нажать «Отправить».",
-        reply_markup=build_convene_keyboard(request_id),
+        "Можно добавить ещё, либо нажать «Готово».",
+        reply_markup=build_convene_keyboard(data["request_id"]),
     )
 
 
 async def on_convene_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    chat_id = update.effective_chat.id
     sender_id = message.from_user.id
 
-    request_id = active_convene_session.pop((chat_id, sender_id), None)
-    if request_id is None:
-        return  # нажатие без активной сессии — просто игнорируем
-
-    data = pending_convene_requests.pop(request_id, None)
-    await send_ephemeral(context, chat_id, sender_id, "Готово.", reply_markup=ReplyKeyboardRemove())
+    data = pending_convene_drafts.get(sender_id)
+    await message.reply_text("Список сохранён.", reply_markup=ReplyKeyboardRemove())
 
     if not data or not data["collected"]:
-        await send_ephemeral(context, chat_id, sender_id, "Никого не выбрали, сообщение не отправлено.")
+        await message.reply_text("Пока никто не выбран — черновик не сохранён.")
+        pending_convene_drafts.pop(sender_id, None)
         return
 
+    count = len(data["collected"])
+    await message.reply_text(
+        f"Готово: сохранено {count} получателей (на {CONVENE_DRAFT_TTL_SECONDS // 60} мин.).\n\n"
+        "Теперь зайди в нужную группу и напиши там команду /send — "
+        "сообщение с упоминаниями отправится туда."
+    )
+
+
+async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    sender_id = update.effective_user.id
+
+    if chat.type == "private":
+        await update.message.reply_text(
+            "Эту команду нужно использовать в группе, куда вы хотите "
+            "отправить подготовленное через /convene сообщение."
+        )
+        return
+
+    data = pending_convene_drafts.get(sender_id)
+
+    if data and time.time() - data["created_at"] > CONVENE_DRAFT_TTL_SECONDS:
+        pending_convene_drafts.pop(sender_id, None)
+        data = None
+
+    if not data or not data["collected"]:
+        await send_ephemeral(
+            context, chat.id, sender_id,
+            "Нет подготовленного сообщения (либо оно устарело). Сначала "
+            "напишите мне в личные сообщения:\n/convene Текст сообщения",
+        )
+        return
+
+    pending_convene_drafts.pop(sender_id, None)
+
     mentions = []
-    for u in data["collected"].values():
-        name = u.first_name or (f"@{u.username}" if u.username else f"пользователь {u.user_id}")
-        safe_name = name.replace("<", "&lt;").replace(">", "&gt;")
-        mentions.append(f'<a href="tg://user?id={u.user_id}">{safe_name}</a>')
+    emojis = pick_mention_emojis(len(data["collected"]))
+    for emoji, u in zip(emojis, data["collected"].values()):
+        # Ссылка именно tg://user?id= (а не https://t.me/username) — только
+        # она присылает уведомление адресату, независимо от того, есть ли
+        # у него юзернейм. Атрибут title не используем — Telegram его не
+        # поддерживает для тега <a>, только href.
+        mentions.append(f'<a href="tg://user?id={u.user_id}">{emoji}</a>')
 
     text = f"{data['content']}\n\n" + " ".join(mentions)
 
-    # А вот это — единственное сообщение, которое видно всем в чате
-    await context.bot.send_message(chat_id=data["chat_id"], text=text, parse_mode="HTML")
+    # Единственное сообщение из этой команды, которое видно всем в группе
+    await context.bot.send_message(chat_id=chat.id, text=text, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
@@ -702,16 +785,19 @@ async def register_ephemeral_commands():
         {"command": "cancel", "description": "Отменить повторение по номеру"},
         {"command": "whisper", "description": "Приватное сообщение человеку"},
         {"command": "id", "description": "Узнать свой ID или ID другого (по ответу)"},
-        {"command": "convene", "description": "Позвать нескольких людей сообщением"},
+        {"command": "convene", "description": "Выбрать получателей для сообщения (в личке)"},
+        {"command": "send", "description": "Отправить подготовленное /convene сообщение сюда"},
     ]
-    # /id не делаем эфемерной командой: без ответа она показывает ID
-    # открыто всем, так что скрывать её ввод было бы непоследовательно.
-    # /convene, наоборот, эфемерна — сам процесс выбора людей скрыт,
-    # видно только итоговое сообщение с упоминаниями.
-    ephemeral_names = {"start", "repeat", "list", "cancel", "whisper", "convene"}
+    # /convene используется в личке (там эфемерность не нужна), а /send в
+    # группе прячем — видно только итоговое сообщение с упоминаниями.
+    ephemeral_names = {"start", "repeat", "list", "cancel", "whisper", "send", "id"}
+    # /convene не имеет смысла в группе (кнопка выбора людей работает
+    # только в личке) — не показываем её в списке команд для групп
+    group_only_excluded = {"convene"}
     group_commands = [
         {**cmd, "is_ephemeral": True} if cmd["command"] in ephemeral_names else cmd
         for cmd in base_commands
+        if cmd["command"] not in group_only_excluded
     ]
 
     private_result = await safe_api_request(
@@ -758,6 +844,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("whisper", whisper_command))
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("convene", convene_command))
+    application.add_handler(CommandHandler("send", send_command))
     application.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, on_users_shared))
     application.add_handler(MessageHandler(filters.Text([CONVENE_DONE_BUTTON]), on_convene_done_button))
     application.add_error_handler(error_handler)
