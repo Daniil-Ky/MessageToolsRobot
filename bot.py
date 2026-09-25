@@ -594,8 +594,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "сообщение)\n\n"
         "/convene Текст — здесь, в личке, выбери получателей (жми "
         "«Добавить получателей» сколько угодно раз, до 10 за раз, затем "
-        "«Готово»), затем зайди в нужную группу и напиши там /send — "
-        "сообщение с упоминаниями уйдёт туда.",
+        "«Готово»). Также можно добавить человека по Telegram ID: "
+        "ответь (reply) на сообщение бота с ID числом — и он добавится. "
+        "Затем зайди в нужную группу и напиши там /send — сообщение с "
+        "упоминаниями уйдёт туда.",
     )
 
 
@@ -728,7 +730,20 @@ def pick_mention_emojis(count: int) -> list[str]:
     return pool + extra
 
 # user_id -> {"content", "collected", "request_id", "created_at"}
+
 pending_convene_drafts: dict[int, dict] = {}
+
+
+class ConveneUserByID:
+    """Объект-заменитель для пользователя, добавленного по Telegram ID
+    в /convene. Имеет только user_id (единственный нужный атрибут для
+    tg://user?id=...), остальные — заглушки, чтобы не ломать код,
+    проверяющий их."""
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.first_name = ""
+        self.last_name = ""
+        self.username = None
 
 
 def build_convene_keyboard(request_id: int) -> ReplyKeyboardMarkup:
@@ -787,7 +802,10 @@ async def convene_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await message.reply_text(
         "Нажимай «Добавить получателей» столько раз, сколько нужно "
-        "(до 10 человек за раз). Когда выберешь всех — жми «Готово».",
+        "(до 10 человек за раз). Когда выберешь всех — жми «Готово».\n"
+        "\n"
+        "💡 Можно также добавить человека по его Telegram ID: "
+        "ответь (reply) на это сообщение числом — и ID добавится в список.",
         reply_markup=build_convene_keyboard(request_id),
     )
 
@@ -958,13 +976,53 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 async def admin_text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ловит следующее сообщение админа, если бот ждёт от него ввод
     (после /broadcast или одной из кнопок меню /referrals). Для всех
-    остальных (не-админов или без ожидаемого ввода) — ничего не делает."""
+    остальных (не-админов или без ожидаемого ввода) — ничего не делает.
+
+    Также ловит числовые Telegram ID, отправленные reply-ом на сообщение
+    бота во время активного черновика /convene — добавляет этого
+    пользователя в список получателей (см. ConveneUserByID)."""
     user_id = update.effective_user.id
+    message = update.message
+    text = (message.text or "").strip()
+
+    # --- Добавление пользователя по Telegram ID в активный /convene ---
+    # Условия: текст состоит только из цифр, отправлен reply-ом на
+    # сообщение бота, у пользователя есть активный черновик /convene,
+    # длина ID в диапазоне 5–12 цифр. Если длина не подходит — просто
+    # игнорируем (не реагируем), чтобы не мешать.
+    if (
+        text.isdigit()
+        and user_id in pending_convene_drafts
+        and message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id == context.bot.id
+    ):
+        if len(text) < 5 or len(text) > 12:
+            # Похоже, это не Telegram ID — молча игнорируем
+            pass
+        else:
+            target_id = int(text)
+            data = pending_convene_drafts[user_id]
+            if target_id in data["collected"]:
+                await message.reply_text(
+                    f"Пользователь с ID {target_id} уже в списке.",
+                    reply_markup=build_convene_keyboard(data["request_id"]),
+                )
+                return
+            data["collected"][target_id] = ConveneUserByID(target_id)
+            count = len(data["collected"])
+            await message.reply_text(
+                f"Добавлен пользователь с ID {target_id}.\n"
+                f"Сейчас выбрано: {count} чел.\n"
+                "Можно добавить ещё, либо нажать «Готово».",
+                reply_markup=build_convene_keyboard(data["request_id"]),
+            )
+            return
+
+    # --- Админский ввод (broadcast, referrals) ---
     state = admin_state.get(user_id)
     if not state or not is_admin(user_id):
         return
-
-    message = update.message
 
     if state == "broadcast":
         admin_state.pop(user_id, None)
