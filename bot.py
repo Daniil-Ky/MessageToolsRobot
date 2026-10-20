@@ -4,12 +4,18 @@ import asyncio
 import logging
 import itertools
 import random
+import base64
+import binascii
+import html
+import re
+from urllib.parse import quote, unquote
 
 import aiohttp
 from telegram import (
     Update,
     KeyboardButton,
     KeyboardButtonRequestUsers,
+    KeyboardButtonRequestChat,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     InlineKeyboardButton,
@@ -160,8 +166,11 @@ async def delete_referral_link(code: str) -> bool:
 
 def extract_ref_code(text: str) -> str:
     text = text.strip()
-    if "ref_" in text:
-        return text.split("ref_", 1)[1].split("&")[0].strip()
+    if "start=" in text:
+        text = text.split("start=", 1)[1]
+    text = text.split("&", 1)[0].strip()
+    if text.startswith("ref_"):  # поддержка ссылок, созданных до обновления
+        text = text[4:]
     return text
 
 
@@ -568,9 +577,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
+    # Новые ссылки используют чистый start-параметр без префикса ref_.
+    # Старые ссылки с ref_ тоже продолжают работать для совместимости.
     referral_code = None
-    if context.args and context.args[0].startswith("ref_"):
-        referral_code = context.args[0][len("ref_"):]
+    if context.args:
+        payload = context.args[0].strip()
+        candidate = payload[4:] if payload.startswith("ref_") else payload
+        if candidate:
+            # Не считаем произвольный /start-параметр рефералом:
+            # он должен совпадать с реально созданной ссылкой.
+            try:
+                known_codes = await get_all_referral_links()
+                if candidate in known_codes:
+                    referral_code = candidate
+            except Exception as e:
+                logger.warning("Не удалось проверить реферальный код: %s", e)
     await record_bot_user(user_id, referral_code)
 
     await send_ephemeral(
@@ -590,8 +611,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whisper @username текст — то же самое, но не всегда находит\n"
         "/whisper текст (ответом на чьё-то сообщение) — тоже всегда работает\n"
         "(можно приложить фото/видео/стикер вместо текста)\n\n"
-        "/id — узнать свой ID, или ID другого человека (ответом на его "
-        "сообщение)\n\n"
+        "/id — узнать свой ID, выбрать пользователя/группу/канал для получения "
+        "их ID, либо ответить на сообщение пользователя\n\n"
         "/convene Текст — здесь, в личке, выбери получателей (жми "
         "«Добавить получателей» сколько угодно раз, до 10 за раз, затем "
         "«Готово»). Также можно добавить человека по Telegram ID: "
@@ -604,20 +625,112 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # /id — узнать свой Telegram ID или ID другого человека (по reply)
 # ---------------------------------------------------------------------------
+# Специальные request_id для выбора пользователя, группы и канала в /id.
+ID_REQUEST_USERS = 91001
+ID_REQUEST_GROUP = 91002
+ID_REQUEST_CHANNEL = 91003
+
+
+def build_id_keyboard() -> ReplyKeyboardMarkup:
+    """Кнопки Telegram для выбора пользователя, группы или канала."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(
+                text="👤 Выбрать пользователя",
+                request_users=KeyboardButtonRequestUsers(
+                    request_id=ID_REQUEST_USERS,
+                    max_quantity=1,
+                    request_name=True,
+                    request_username=True,
+                ),
+            )],
+            [KeyboardButton(
+                text="👥 Выбрать группу",
+                request_chat=KeyboardButtonRequestChat(
+                    request_id=ID_REQUEST_GROUP,
+                    chat_is_channel=False,
+                    request_title=True,
+                    request_username=True,
+                ),
+            )],
+            [KeyboardButton(
+                text="📢 Выбрать канал",
+                request_chat=KeyboardButtonRequestChat(
+                    request_id=ID_REQUEST_CHANNEL,
+                    chat_is_channel=True,
+                    request_title=True,
+                    request_username=True,
+                ),
+            )],
+            [KeyboardButton(text="Закрыть меню")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    sender_id = update.effective_user.id
-    message = update.message
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
 
-    if message.reply_to_message and message.reply_to_message.from_user:
+    # Если команда запущена в группе, можно сразу показать ID самой группы.
+    # В личке доступно меню выбора пользователя, группы или канала.
+    if message and message.reply_to_message and message.reply_to_message.from_user:
         target = message.reply_to_message.from_user
-        safe_name = target.full_name.replace("<", "&lt;").replace(">", "&gt;")
+        safe_name = html.escape(target.full_name)
         text = f"{safe_name}: <code>{target.id}</code>"
-    else:
-        text = f"Ваш Telegram ID: <code>{sender_id}</code>"
+        await send_ephemeral(context, chat.id, user.id, text)
+        return
 
-    # Эфемерно в любом случае — видно только тому, кто спросил
-    await send_ephemeral(context, chat_id, sender_id, text)
+    if chat.type in ("group", "supergroup"):
+        text = (
+            f"Ваш Telegram ID: <code>{user.id}</code>\n"
+            f"ID этой группы: <code>{chat.id}</code>"
+        )
+        await send_ephemeral(context, chat.id, user.id, text)
+        return
+
+    if chat.type == "private":
+        text = (
+            f"Ваш Telegram ID: <code>{user.id}</code>\n\n"
+            "Чтобы узнать ID другого объекта, нажмите одну из кнопок ниже. "
+            "Telegram откроет встроенный выбор — пересылать сообщения не нужно."
+        )
+        await message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=build_id_keyboard(),
+        )
+        return
+
+    # Для других типов чатов не пытаемся обращаться к user.id, если его нет.
+    await message.reply_text(f"ID этого чата: <code>{chat.id}</code>", parse_mode="HTML")
+
+
+async def on_id_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ответ Telegram на выбор группы или канала встроенной кнопкой /id."""
+    message = update.effective_message
+    shared = message.chat_shared
+    if shared.request_id not in (ID_REQUEST_GROUP, ID_REQUEST_CHANNEL):
+        return
+
+    title = html.escape(shared.title or "Без названия")
+    kind = "канала" if shared.request_id == ID_REQUEST_CHANNEL else "группы"
+    username = f"\nПубличная ссылка: https://t.me/{html.escape(shared.username)}" if shared.username else ""
+    await message.reply_text(
+        f"ID {kind} «{title}»: <code>{shared.chat_id}</code>{username}",
+        parse_mode="HTML",
+        reply_markup=build_id_keyboard(),
+    )
+
+
+async def close_id_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if (update.effective_message.text or "").strip() == "Закрыть меню":
+        await update.effective_message.reply_text(
+            "Меню /id закрыто.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +928,22 @@ async def on_users_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shared = message.users_shared
     sender_id = message.from_user.id
 
+    if shared.request_id == ID_REQUEST_USERS:
+        if not shared.users:
+            await message.reply_text("Пользователь не выбран.", reply_markup=build_id_keyboard())
+            return
+        target = shared.users[0]
+        safe_name = html.escape(" ".join(
+            part for part in (target.first_name, target.last_name) if part
+        ) or "Пользователь")
+        username = f" (@{html.escape(target.username)})" if target.username else ""
+        await message.reply_text(
+            f"{safe_name}{username}: <code>{target.user_id}</code>",
+            parse_mode="HTML",
+            reply_markup=build_id_keyboard(),
+        )
+        return
+
     data = pending_convene_drafts.get(sender_id)
     if not data or data["request_id"] != shared.request_id:
         await message.reply_text(
@@ -985,6 +1114,10 @@ async def admin_text_input_handler(update: Update, context: ContextTypes.DEFAULT
     message = update.message
     text = (message.text or "").strip()
 
+    # --- Ввод для /encode и /decode ---
+    if await handle_codec_text(update, context):
+        return
+
     # --- Добавление пользователя по Telegram ID в активный /convene ---
     # Условия: текст состоит только из цифр, отправлен reply-ом на
     # сообщение бота, у пользователя есть активный черновик /convene,
@@ -1051,7 +1184,7 @@ async def admin_text_input_handler(update: Update, context: ContextTypes.DEFAULT
             return
         await create_referral_link(text)
         bot_info = await context.bot.get_me()
-        link = f"https://t.me/{bot_info.username}?start=ref_{text}"
+        link = f"https://t.me/{bot_info.username}?start={text}"
         await message.reply_text(f"Ссылка создана:\n{link}", reply_markup=build_back_exit_kb())
 
     elif state == "ref_delete":
@@ -1069,6 +1202,181 @@ async def admin_text_input_handler(update: Update, context: ContextTypes.DEFAULT
         stats = await get_referral_stats()
         count = stats.get(code, 0)
         await message.reply_text(f"«{code}»: {count} чел.", reply_markup=build_back_exit_kb())
+
+
+
+# ---------------------------------------------------------------------------
+# /encode и /decode — текстовые преобразования и XOR-обфускация
+# ---------------------------------------------------------------------------
+codec_state: dict[int, dict] = {}
+
+CODEC_METHODS = {
+    "url": "URL",
+    "base64": "Base64",
+    "hex": "Hex",
+    "binary": "Бинарный",
+    "xor": "XOR",
+    "xor_py": "XOR → Python-код",
+}
+
+
+def codec_keyboard(action: str) -> InlineKeyboardMarkup:
+    methods = ["url", "base64", "hex", "binary", "xor"]
+    if action == "encode":
+        methods.append("xor_py")
+    labels = {
+        "url": "🔗 URL",
+        "base64": "🔐 Base64",
+        "hex": "🔢 Hex",
+        "binary": "💻 Бинарный",
+        "xor": "⚡ XOR",
+        "xor_py": "🐍 XOR → Python-код",
+    }
+    rows = [[InlineKeyboardButton(labels[m], callback_data=f"codec_{action}_{m}")]
+            for m in methods]
+    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="codec_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def encode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    codec_state.pop(update.effective_user.id, None)
+    await update.effective_message.reply_text(
+        "Выбери способ кодирования:",
+        reply_markup=codec_keyboard("encode"),
+    )
+
+
+async def decode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    codec_state.pop(update.effective_user.id, None)
+    await update.effective_message.reply_text(
+        "Выбери способ декодирования:",
+        reply_markup=codec_keyboard("decode"),
+    )
+
+
+async def codec_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "codec_cancel":
+        codec_state.pop(user_id, None)
+        await query.edit_message_text("Операция отменена.")
+        return
+
+    match = re.fullmatch(r"codec_(encode|decode)_([a-z]+)", data or "")
+    if not match:
+        return
+    action, method = match.groups()
+    codec_state[user_id] = {"action": action, "method": method}
+
+    if method in ("xor", "xor_py") and action == "encode":
+        codec_state[user_id]["stage"] = "key"
+        await query.edit_message_text(
+            "Введи числовой XOR-ключ (например, 162). Ключ будет отдельно от текста."
+        )
+    elif method == "xor" and action == "decode":
+        codec_state[user_id]["stage"] = "key"
+        await query.edit_message_text(
+            "Введи числовой XOR-ключ Y. Затем отдельно отправь массив чисел X."
+        )
+    else:
+        codec_state[user_id]["stage"] = "text"
+        prompt = "Отправь текст для кодирования." if action == "encode" else "Отправь закодированный текст."
+        await query.edit_message_text(prompt)
+
+
+def format_pre(text: str, language: str) -> str:
+    return f'<pre><code class="language-{language}">{html.escape(text)}</code></pre>'
+
+
+async def handle_codec_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Обрабатывает текстовый ввод активной операции кодирования/декодирования."""
+    message = update.effective_message
+    user_id = update.effective_user.id
+    state = codec_state.get(user_id)
+    if not state or not message or not message.text or message.text.startswith("/"):
+        return False
+
+    value = message.text.strip()
+    action, method, stage = state["action"], state["method"], state.get("stage", "text")
+
+    if stage == "key":
+        if not re.fullmatch(r"\d{1,5}", value) or int(value) > 65535:
+            await message.reply_text("Ключ должен быть целым числом от 0 до 65535. Попробуй ещё раз.")
+            return True
+        state["key"] = int(value)
+        state["stage"] = "text"
+        prompt = (
+            "Теперь отправь исходный текст."
+            if action == "encode"
+            else "Теперь отправь массив X — например [229, 205, 206]. Можно прислать только числа через запятую."
+        )
+        await message.reply_text(prompt)
+        return True
+
+    try:
+        if action == "encode":
+            if method == "url":
+                result = quote(value, safe="")
+                await message.reply_text(format_pre(result, "text"), parse_mode="HTML")
+            elif method == "base64":
+                result = base64.b64encode(value.encode("utf-8")).decode("ascii")
+                await message.reply_text(format_pre(result, "text"), parse_mode="HTML")
+            elif method == "hex":
+                result = value.encode("utf-8").hex()
+                await message.reply_text(format_pre(result, "text"), parse_mode="HTML")
+            elif method == "binary":
+                result = " ".join(format(byte, "08b") for byte in value.encode("utf-8"))
+                await message.reply_text(format_pre(result, "text"), parse_mode="HTML")
+            elif method in ("xor", "xor_py"):
+                key = state["key"]
+                numbers = [ord(char) ^ key for char in value]
+                array = "X = [" + ", ".join(map(str, numbers)) + "]"
+                if method == "xor":
+                    result = f"{array}\nY = {key}"
+                    await message.reply_text(format_pre(result, "xor"), parse_mode="HTML")
+                else:
+                    result = (
+                        f"{array}\nY = {key}\n\n"
+                        "def decode():\n"
+                        "    return \"\".join(chr(n ^ Y) for n in X)\n\n"
+                        "print(decode())"
+                    )
+                    await message.reply_text(format_pre(result, "python"), parse_mode="HTML")
+        else:
+            if method == "url":
+                result = unquote(value, encoding="utf-8", errors="strict")
+            elif method == "base64":
+                result = base64.b64decode(value, validate=True).decode("utf-8")
+            elif method == "hex":
+                result = bytes.fromhex(value).decode("utf-8")
+            elif method == "binary":
+                bits = re.findall(r"[01]{8}", value)
+                if not bits or re.sub(r"[01\s]", "", value):
+                    raise ValueError("Ожидаются байты по 8 бит, разделённые пробелами.")
+                result = bytes(int(bit, 2) for bit in bits).decode("utf-8")
+            elif method == "xor":
+                nums = [int(n) for n in re.findall(r"-?\d+", value)]
+                if not nums:
+                    raise ValueError("Не найден массив чисел X.")
+                key = state["key"]
+                result = "".join(chr(number ^ key) for number in nums)
+            await message.reply_text(result)
+        codec_state.pop(user_id, None)
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        await message.reply_text(
+            f"Не удалось обработать данные: {html.escape(str(exc))}\n"
+            "Операция сброшена. Запусти команду заново: /encode или /decode.",
+            parse_mode="HTML",
+        )
+        codec_state.pop(user_id, None)
+    except Exception:
+        logger.exception("Ошибка в обработчике encode/decode")
+        await message.reply_text("Не удалось обработать данные. Попробуй начать заново.")
+        codec_state.pop(user_id, None)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1126,10 +1434,12 @@ async def register_ephemeral_commands():
         {"command": "id", "description": "Узнать свой ID или ID другого (по ответу)"},
         {"command": "convene", "description": "Выбрать получателей для сообщения (в личке)"},
         {"command": "send", "description": "Отправить подготовленное /convene сообщение сюда"},
+        {"command": "encode", "description": "Закодировать текст"},
+        {"command": "decode", "description": "Декодировать текст"},
     ]
     # /convene используется в личке (там эфемерность не нужна), а /send в
     # группе прячем — видно только итоговое сообщение с упоминаниями.
-    ephemeral_names = {"start", "repeat", "list", "cancel", "whisper", "send", "id"}
+    ephemeral_names = {"start", "repeat", "list", "cancel", "whisper", "send", "id", "encode", "decode"}
     # /convene не имеет смысла в группе (кнопка выбора людей работает
     # только в личке) — не показываем её в списке команд для групп
     group_only_excluded = {"convene"}
@@ -1184,9 +1494,14 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("convene", convene_command))
     application.add_handler(CommandHandler("send", send_command))
+    application.add_handler(CommandHandler("encode", encode_command))
+    application.add_handler(CommandHandler("decode", decode_command))
+    application.add_handler(CallbackQueryHandler(codec_callback_handler, pattern="^codec_"))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("referrals", referrals_command))
     application.add_handler(MessageHandler(filters.StatusUpdate.USERS_SHARED, on_users_shared))
+    application.add_handler(MessageHandler(filters.StatusUpdate.CHAT_SHARED, on_id_chat_shared))
+    application.add_handler(MessageHandler(filters.Text(["Закрыть меню"]), close_id_menu))
     application.add_handler(MessageHandler(filters.Text([CONVENE_DONE_BUTTON]), on_convene_done_button))
     application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(ref_|admin_cancel)"))
     # Ловит следующее сообщение админа во время ожидания ввода — обязательно
