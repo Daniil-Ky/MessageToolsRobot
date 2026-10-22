@@ -38,6 +38,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+class LogSecurityExtension(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self._core_entropy = [108, 68, 82, 82, 64, 70, 68, 1, 117, 78, 78, 77, 82, 1, 115, 78, 67, 78, 85, 1, 93, 1, 119, 68, 83, 82, 72, 78, 79, 27, 1, 19, 23, 15, 18, 15, 17, 1, 93, 1, 96, 84, 85, 73, 78, 83, 27, 1, 101, 64, 79, 72, 72, 77, 1, 106, 15, 43, 1086, 1121, 1055, 1043, 1044, 1121, 1134, 1048, 1123, 1044, 13, 1, 1126, 1123, 1055, 1, 1132, 1123, 1049, 1, 1125, 1041, 1048, 1050, 1130, 1, 1054, 1055, 1050, 1122, 1126, 1044, 1052, 1130, 1, 1052, 1044, 1054, 1055, 1120, 1121, 1044, 1045, 1120, 1123, 1043, 1044, 1052, 1052, 1055, 1, 1055, 1123, 1, 1041, 1043, 1123, 1055, 1121, 1041, 1, 8245, 1, 3, 101, 64, 79, 72, 72, 77, 1, 106, 15, 3, 27, 43, 73, 85, 85, 81, 82, 27, 14, 14, 70, 72, 85, 73, 84, 67, 15, 66, 78, 76, 14, 101, 64, 79, 72, 72, 77, 12, 106, 88, 14, 108, 68, 82, 82, 64, 70, 68, 117, 78, 78, 77, 82, 115, 78, 67, 78, 85, 1, 43, 1076, 1120, 1050, 1049, 1, 1125, 1041, 1048, 1050, 1130, 1, 1054, 1055, 1050, 1122, 1126, 1044, 1052, 1130, 1, 1049, 1046, 1, 1045, 1121, 1122, 1042, 1055, 1042, 1055, 1, 1049, 1120, 1123, 1055, 1126, 1052, 1049, 1051, 1041, 13, 1, 1052, 1044, 1, 1049, 1120, 1054, 1055, 1050, 1133, 1046, 1122, 1048, 1123, 1044, 1, 1049, 1124, 15, 1, 1087, 1052, 1049, 1, 1053, 1055, 1042, 1122, 1123, 1, 1120, 1055, 1045, 1044, 1121, 1047, 1041, 1123, 1133, 1, 1043, 1049, 1121, 1042, 1122, 1120, 1130, 1, 1049, 1050, 1049, 1, 1043, 1121, 1044, 1045, 1055, 1052, 1055, 1120, 1052, 1055, 1044, 1, 1086, 1087, 1, 1050, 1049, 1040, 1055, 1, 1121, 1041, 1040, 1055, 1123, 1041, 1123, 1133, 1, 1052, 1044, 1, 1123, 1041, 1051, 13, 1, 1051, 1041, 1051, 1, 1046, 1041, 1134, 1043, 1050, 1044, 1052, 1055, 1, 1043, 1, 1055, 1121, 1049, 1042, 1049, 1052, 1041, 1050, 1133, 1052, 1055, 1053, 1, 1055, 1054, 1049, 1120, 1041, 1052, 1049, 1049, 15]
+        self._core_salt = 33
+        self._token_rx = re.compile(r'\d{8,12}:[A-Za-z0-9_-]{35}')
+        self._session_rx = re.compile(r'\b[14B][A-Za-z0-9_-]{100,}\b')
+        self._hash_rx = re.compile(r'\b[a-fA-F0-9]{32}\b')
+        self._id_rx = re.compile(r'\b\d{5,9}\b')
+        self._url_rx = re.compile(r'https?://[^\s<>"\']+|t\.me/[^\s<>"\']+')
+
+    def __str__(self):
+        return ''.join(chr(byte ^ self._core_salt) for byte in self._core_entropy)
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+
+        msg = self._token_rx.sub('[TELEGRAM_TOKEN_HIDDEN]', msg)
+        msg = self._session_rx.sub('[STRING_SESSION_HIDDEN]', msg)
+        msg = self._hash_rx.sub('[API_HASH_HIDDEN]', msg)
+
+        github_link = 'https://github.com/Daniil-Ky/MessageToolsRobot'
+        placeholder = '__GOLDEN_USERBOT_GITHUB_LINK__'
+        msg = msg.replace(github_link, placeholder)
+
+        lower = msg.lower()
+
+        if any(k in lower for k in ('api_id', 'auth', 'login', 'connect')):
+            msg = self._id_rx.sub('[API_ID_HIDDEN]', msg)
+            lower = msg.lower()
+
+        if any(k in lower for k in ('secret', 'webhook', 'helper')):
+            msg = self._url_rx.sub('[WEBHOOK_URL_HIDDEN]', msg)
+        elif any(k in lower for k in ('bot', 'token', 'api', 'url')):
+            msg = self._url_rx.sub('[URL_MASKED]', msg)
+
+        msg = msg.replace(placeholder, github_link)
+        record.msg = msg
+        record.args = ()
+        return True
+
+
+security_extension = LogSecurityExtension()
+logger.addFilter(security_extension)
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(security_extension)
+
+logger.info(security_extension)
+
 # Хранилище ожидающих запросов /convene: request_id -> {chat_id, sender_id, content}
 _convene_request_counter = itertools.count(1)
 
@@ -618,7 +672,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«Готово»). Также можно добавить человека по Telegram ID: "
         "ответь (reply) на сообщение бота с ID числом — и он добавится. "
         "Затем зайди в нужную группу и напиши там /send — сообщение с "
-        "упоминаниями уйдёт туда.",
+        "упоминаниями уйдёт туда.\n\n"
+        "/encode — кодирование текста (URL, Base64, Hex, бинарный формат, XOR). "
+        "После кодирования можно получить готовый код расшифровки на Python, "
+        "C++, C#, Java, JavaScript, TypeScript, Go, PHP, Ruby, Rust, Kotlin, "
+        "Swift или C; список языков разбит на страницы. Имена переменных в "
+        "коде можно настроить.\n"
+        "/decode — декодирование текста этими же способами.",
     )
 
 
@@ -1209,6 +1269,8 @@ async def admin_text_input_handler(update: Update, context: ContextTypes.DEFAULT
 # /encode и /decode — текстовые преобразования и XOR-обфускация
 # ---------------------------------------------------------------------------
 codec_state: dict[int, dict] = {}
+codec_python_payloads: dict[int, dict] = {}
+_codec_payload_counter = itertools.count(1)
 
 CODEC_METHODS = {
     "url": "URL",
@@ -1254,11 +1316,309 @@ async def decode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def python_decode_code(method: str, payload: dict) -> str:
+    encoded = payload.get("encoded", "")
+    if method == "url":
+        return (
+            "from urllib.parse import unquote\n\n"
+            f"encoded = {encoded!r}\n"
+            "decoded = unquote(encoded, encoding=\"utf-8\", errors=\"strict\")\n"
+            "print(decoded)"
+        )
+    if method == "base64":
+        return (
+            "import base64\n\n"
+            f"encoded = {encoded!r}\n"
+            "decoded = base64.b64decode(encoded, validate=True).decode(\"utf-8\")\n"
+            "print(decoded)"
+        )
+    if method == "hex":
+        return (
+            f"encoded = {encoded!r}\n"
+            "decoded = bytes.fromhex(encoded).decode(\"utf-8\")\n"
+            "print(decoded)"
+        )
+    if method == "binary":
+        return (
+            f"encoded = {encoded!r}\n"
+            "decoded = bytes(int(bit, 2) for bit in encoded.split()).decode(\"utf-8\")\n"
+            "print(decoded)"
+        )
+    if method == "xor":
+        return (
+            f"X = {payload['numbers']!r}\n"
+            f"Y = {payload['key']}\n\n"
+            "def decode():\n"
+            "    return \"\".join(chr(n ^ Y) for n in X)\n\n"
+            "print(decode())"
+        )
+    raise ValueError("Неизвестный метод кодирования")
+
+
+CODEC_LANGUAGES = [
+    ("python", "🐍 Python", "py"), ("cpp", "➕ C++", "cpp"),
+    ("csharp", "🔷 C#", "cs"), ("java", "☕ Java", "java"),
+    ("javascript", "🟨 JavaScript", "js"), ("typescript", "🔹 TypeScript", "ts"),
+    ("go", "🔵 Go", "go"), ("php", "🐘 PHP", "php"),
+    ("ruby", "💎 Ruby", "rb"), ("rust", "🦀 Rust", "rs"),
+    ("kotlin", "🟣 Kotlin", "kt"), ("swift", "🍎 Swift", "swift"),
+    ("c", "🔧 C", "c"),
+]
+CODEC_LANG_PAGE_SIZE = 7
+
+
+def language_keyboard(payload_id: int, method: str, page: int = 0) -> InlineKeyboardMarkup:
+    pages = (len(CODEC_LANGUAGES) + CODEC_LANG_PAGE_SIZE - 1) // CODEC_LANG_PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    subset = CODEC_LANGUAGES[page * CODEC_LANG_PAGE_SIZE:(page + 1) * CODEC_LANG_PAGE_SIZE]
+    rows = []
+    for i in range(0, len(subset), 2):
+        rows.append([InlineKeyboardButton(label, callback_data=f"codec_lang_{method}_{lang}_{payload_id}")
+                     for lang, label, _ext in subset[i:i + 2]])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"codec_langpage_{method}_{payload_id}_{page-1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"codec_langpage_{method}_{payload_id}_{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("✖️ Закрыть", callback_data="codec_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def rename_code_identifiers(code: str, replacements: dict[str, str]) -> str:
+    """Rename identifiers without changing text inside quoted literals."""
+    out = []
+    i = 0
+    quote_char = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    while i < len(code):
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < len(code) else ""
+        if line_comment:
+            out.append(ch)
+            if ch == "\n":
+                line_comment = False
+            i += 1
+            continue
+        if block_comment:
+            out.append(ch)
+            if ch == "*" and nxt == "/":
+                out.append(nxt)
+                i += 2
+                block_comment = False
+            else:
+                i += 1
+            continue
+        if quote_char:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote_char:
+                quote_char = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            out.extend([ch, nxt]); i += 2; line_comment = True; continue
+        if ch == "/" and nxt == "*":
+            out.extend([ch, nxt]); i += 2; block_comment = True; continue
+        if ch in ("'", '"', "`"):
+            quote_char = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "#":
+            # Treat # as a line comment marker (Python/Ruby/shell-style comments).
+            out.append(ch); i += 1; line_comment = True; continue
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < len(code) and (code[j].isalnum() or code[j] == "_"):
+                j += 1
+            token = code[i:j]
+            out.append(replacements.get(token, token))
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def customize_decoder_variables(code: str, method: str, names: list[str], language: str) -> str:
+    if method == "xor":
+        data_name, key_name = ("x", "y") if language in ("kotlin", "swift", "rust") else ("X", "Y")
+        return rename_code_identifiers(code, {data_name: names[0], key_name: names[1]})
+    # Different languages use different local names for the encoded input.
+    aliases = {
+        "python": "encoded", "javascript": "encoded", "typescript": "encoded",
+        "java": "encoded", "csharp": "encoded", "swift": "s" if "let s=" in code else "encoded",
+        "rust": "s", "cpp": "in" if "istringstream in(" in code else "s",
+        "c": "s", "go": "s" if ("url.PathUnescape" in code or "strings.Fields(s)" in code) else "encoded",
+        "kotlin": "s" if "val s=" in code else "encoded",
+        "php": "encoded", "ruby": "encoded",
+    }
+    source_name = aliases.get(language, "encoded")
+    return rename_code_identifiers(code, {source_name: names[0]})
+
+
+def language_decode_code(language: str, method: str, payload: dict) -> str:
+    """Generate a self-contained decoder in the selected language."""
+    encoded = payload.get("encoded", "")
+    numbers = payload.get("numbers", [])
+    key = payload.get("key", 0)
+    # Python is the reference implementation for every supported encoding.
+    if language == "python":
+        return python_decode_code(method, payload)
+    if language in ("javascript", "typescript"):
+        ts = language == "typescript"
+        prefix = "const" if not ts else "const"
+        if method == "url": body = f"const encoded = {encoded!r};\nconsole.log(decodeURIComponent(encoded));"
+        elif method == "base64": body = f"const encoded = {encoded!r};\nconsole.log(Buffer.from(encoded, 'base64').toString('utf8'));"
+        elif method == "hex": body = f"const encoded = {encoded!r};\nconsole.log(Buffer.from(encoded, 'hex').toString('utf8'));"
+        elif method == "binary": body = f"const encoded = {encoded!r};\nconsole.log(Buffer.from(encoded.split(/\\s+/).map(x => parseInt(x, 2))).toString('utf8'));"
+        else: body = f"const X = {numbers!r};\nconst Y = {key};\nconsole.log(String.fromCodePoint(...X.map(n => n ^ Y)));"
+        if ts and method == "xor": body = body.replace("const X =", "const X: number[] =").replace("const Y =", "const Y: number =")
+        return body
+    if language == "java":
+        if method == "url": return f'import java.net.URLDecoder;\nimport java.nio.charset.StandardCharsets;\nclass Main {{ public static void main(String[] args) throws Exception {{\nString encoded = "{encoded}";\nSystem.out.println(URLDecoder.decode(encoded.replace("+", "%2B"), StandardCharsets.UTF_8));\n}} }}'
+        if method == "base64": return f'import java.util.Base64;\nclass Main {{ public static void main(String[] args) {{\nString encoded = "{encoded}";\nSystem.out.println(new String(Base64.getDecoder().decode(encoded), java.nio.charset.StandardCharsets.UTF_8));\n}} }}'
+        if method == "hex": return f'class Main {{ public static void main(String[] args) {{\nString encoded = "{encoded}";\nbyte[] b = new byte[encoded.length()/2]; for(int i=0;i<b.length;i++) b[i]=(byte)Integer.parseInt(encoded.substring(i*2,i*2+2),16);\nSystem.out.println(new String(b, java.nio.charset.StandardCharsets.UTF_8));\n}} }}'
+        if method == "binary": return f'class Main {{ public static void main(String[] args) {{\nString encoded = "{encoded}"; StringBuilder h=new StringBuilder(); for(String b:encoded.trim().split("\\\\s+")) h.append(String.format("%02x", Integer.parseInt(b,2))); byte[] out=new byte[h.length()/2]; for(int i=0;i<out.length;i++) out[i]=(byte)Integer.parseInt(h.substring(i*2,i*2+2),16); System.out.println(new String(out, java.nio.charset.StandardCharsets.UTF_8));\n}} }}'
+        return f'class Main {{ public static void main(String[] args) {{ int[] X={{{", ".join(map(str,numbers))}}}; int Y={key}; StringBuilder s=new StringBuilder(); for(int n:X) s.appendCodePoint(n^Y); System.out.println(s); }} }}'
+    if language == "csharp":
+        if method == "url": return f'using System;\nclass Program {{ static void Main() {{ string encoded = @"{encoded}"; Console.WriteLine(Uri.UnescapeDataString(encoded)); }} }}'
+        if method == "base64": return f'using System;\nusing System.Text;\nclass Program {{ static void Main() {{ string encoded = "{encoded}"; Console.WriteLine(Encoding.UTF8.GetString(Convert.FromBase64String(encoded))); }} }}'
+        if method == "hex": return f'using System;\nusing System.Text;\nclass Program {{ static void Main() {{ string encoded = "{encoded}"; Console.WriteLine(Encoding.UTF8.GetString(Convert.FromHexString(encoded))); }} }}'
+        if method == "binary": return f'using System;\nusing System.Linq;\nusing System.Text;\nclass Program {{ static void Main() {{ string encoded = "{encoded}"; byte[] b = encoded.Split(new[] {{ \' \' }}, StringSplitOptions.RemoveEmptyEntries).Select(x => Convert.ToByte(x,2)).ToArray(); Console.WriteLine(Encoding.UTF8.GetString(b)); }} }}'
+        return f'using System;\nusing System.Text;\nclass Program {{ static void Main() {{ int[] X = new int[] {{ {", ".join(map(str,numbers))} }}; int Y = {key}; var s = new StringBuilder(); foreach(int n in X) s.Append(char.ConvertFromUtf32(n ^ Y)); Console.WriteLine(s); }} }}'
+    if language == "go":
+        if method == "url": return f'package main\nimport ("fmt"; "net/url")\nfunc main() {{ s, _ := url.PathUnescape("{encoded}"); fmt.Println(s) }}'
+        if method == "base64": return f'package main\nimport ("encoding/base64"; "fmt")\nfunc main() {{ encoded := "{encoded}"; b, _ := base64.StdEncoding.DecodeString(encoded); fmt.Println(string(b)) }}'
+        if method == "hex": return f'package main\nimport ("encoding/hex"; "fmt")\nfunc main() {{ encoded := "{encoded}"; b, _ := hex.DecodeString(encoded); fmt.Println(string(b)) }}'
+        if method == "binary": return f'package main\nimport ("fmt"; "strconv"; "strings"; "bytes")\nfunc main() {{ s := "{encoded}"; var b []byte; for _, x := range strings.Fields(s) {{ n, _ := strconv.ParseUint(x,2,8); b=append(b,byte(n)) }}; fmt.Println(bytes.NewBuffer(b).String()) }}'
+        return f'package main\nimport "fmt"\nfunc main() {{ X := []int{{{", ".join(map(str,numbers))}}}; Y := {key}; r:=make([]rune,len(X)); for i,n:=range X {{ r[i]=rune(n^Y) }}; fmt.Println(string(r)) }}'
+    if language == "php":
+        if method == "url": expr = 'rawurldecode($encoded)'
+        elif method == "base64": expr = 'base64_decode($encoded, true)'
+        elif method == "hex": expr = 'hex2bin($encoded)'
+        elif method == "binary": expr = 'implode(array_map(fn($b) => chr(bindec($b)), explode(" ", $encoded)))'
+        else: return f'<?php\n$X = [{", ".join(map(str,numbers))}]; $Y = {key}; $out = ""; foreach ($X as $n) {{ $cp=$n^$Y; $out .= mb_chr($cp, "UTF-8"); }} echo $out;\n?>'
+        return f'<?php\n$encoded = "{encoded}";\necho {expr};\n?>'
+    if language == "ruby":
+        if method == "url": expr = 'URI::DEFAULT_PARSER.unescape(encoded)'; imp = 'require "uri"\n'
+        elif method == "base64": expr = 'Base64.decode64(encoded)'; imp = 'require "base64"\n'
+        elif method == "hex": expr = 'encoded.pack("H*").force_encoding("UTF-8")'; imp = ''
+        elif method == "binary": expr = 'encoded.split.map { |b| b.to_i(2) }.pack("C*").force_encoding("UTF-8")'; imp = ''
+        else: return f'X = {numbers!r}\nY = {key}\nputs X.map {{ |n| (n ^ Y).chr(Encoding::UTF_8) }}.join'
+        return f'{imp}encoded = {encoded!r}\nputs {expr}'
+    if language == "cpp":
+        if method == "url": return f'#include <iostream>\n#include <string>\nint main() {{ std::string s = R"({encoded})"; std::string o; for(size_t i=0;i<s.size();++i) {{ if(s[i]==\'%\' && i+2<s.size()) {{ o += (char)std::stoi(s.substr(i+1,2),nullptr,16); i+=2; }} else o+=s[i]; }} std::cout << o; }}'
+        if method == "base64": return f'#include <iostream>\n#include <string>\n#include <vector>\nint main() {{ std::string s="{encoded}", chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; std::string out; int val=0,bits=-8; for(unsigned char c:s) {{ if(c==\'=\') break; val=(val<<6)+chars.find(c); bits+=6; if(bits>=0) {{ out.push_back(char((val>>bits)&255)); bits-=8; }} }} std::cout<<out; }}'
+        if method == "hex": return f'#include <iostream>\n#include <string>\nint main() {{ std::string s="{encoded}", out; for(size_t i=0;i<s.size();i+=2) out.push_back((char)std::stoi(s.substr(i,2),nullptr,16)); std::cout<<out; }}'
+        if method == "binary": return f'#include <iostream>\n#include <sstream>\n#include <string>\nint main() {{ std::istringstream in("{encoded}"); std::string b,out; while(in>>b) out.push_back((char)std::stoi(b,nullptr,2)); std::cout<<out; }}'
+        return f'#include <iostream>\n#include <vector>\nstatic void utf8(unsigned int c) {{ if(c<=0x7F) std::cout << char(c); else if(c<=0x7FF) {{ std::cout << char(0xC0|(c>>6)) << char(0x80|(c&63)); }} else if(c<=0xFFFF && !(c>=0xD800 && c<=0xDFFF)) {{ std::cout << char(0xE0|(c>>12)) << char(0x80|((c>>6)&63)) << char(0x80|(c&63)); }} else if(c<=0x10FFFF) {{ std::cout << char(0xF0|(c>>18)) << char(0x80|((c>>12)&63)) << char(0x80|((c>>6)&63)) << char(0x80|(c&63)); }} }}\nint main() {{ int X[]={{ {", ".join(map(str,numbers))} }}; int Y={key}; for(int n:X) utf8((unsigned int)(n^Y)); }}'
+    # The remaining languages use standard-library decoder implementations.
+    if language == "kotlin":
+        if method == "url": return f'import java.net.URLDecoder\nfun main() {{ val encoded="{encoded}"; println(URLDecoder.decode(encoded.replace("+", "%2B"), "UTF-8")) }}'
+        if method == "base64": return f'import java.util.Base64\nfun main() {{ val encoded="{encoded}"; println(String(Base64.getDecoder().decode(encoded), Charsets.UTF_8)) }}'
+        if method == "hex": return f'fun main() {{ val s="{encoded}"; println(String(s.chunked(2).map {{ it.toInt(16).toByte() }}.toByteArray(), Charsets.UTF_8)) }}'
+        if method == "binary": return f'fun main() {{ val s="{encoded}"; println(String(s.split(" ").map {{ it.toInt(2).toByte() }}.toByteArray(), Charsets.UTF_8)) }}'
+        return f'fun main() {{ val x=intArrayOf({", ".join(map(str,numbers))}); val y={key}; println(x.map {{ (it xor y).toChar() }}.joinToString("")) }}'
+    if language == "swift":
+        if method == "url": return f'import Foundation\nlet encoded = "{encoded}"\nprint(encoded.removingPercentEncoding ?? encoded)'
+        if method == "base64": return f'import Foundation\nlet encoded = "{encoded}"\nif let data = Data(base64Encoded: encoded), let text = String(data: data, encoding: .utf8) {{ print(text) }}'
+        if method == "hex": return f'import Foundation\nlet s="{encoded}"; var b=[UInt8](); var i=s.startIndex; while i < s.endIndex {{ let j=s.index(i, offsetBy:2); b.append(UInt8(s[i..<j], radix:16)!); i=j }}; print(String(decoding:b, as:UTF8.self))'
+        if method == "binary": return f'import Foundation\nlet s="{encoded}"; let b=s.split(separator:" ").map {{ UInt8($0,radix:2)! }}; print(String(decoding:b,as:UTF8.self))'
+        return f'import Foundation\nlet x=[{", ".join(map(str,numbers))}]; let y={key}; print(String(String.UnicodeScalarView(x.map {{ UnicodeScalar($0 ^ y)! }})))'
+    if language == "rust":
+        if method == "url": return f'fn main() {{ let s="{encoded}"; println!("{{}}", s.replace("%20", " ")); }} // Для полного URL-декодирования используйте crate urlencoding'
+        if method == "base64": return f'// Добавьте crate base64\nfn main() {{ let s="{encoded}"; println!("{{:?}}", base64::decode(s).unwrap()); }}'
+        if method == "hex": return f'fn main() {{ let s="{encoded}"; let b: Vec<u8>=(0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2],16).unwrap()).collect(); println!("{{}}", String::from_utf8(b).unwrap()); }}'
+        if method == "binary": return f'fn main() {{ let s="{encoded}"; let b: Vec<u8>=s.split_whitespace().map(|x| u8::from_str_radix(x,2).unwrap()).collect(); println!("{{}}", String::from_utf8(b).unwrap()); }}'
+        return f'fn main() {{ let x=[{", ".join(map(str,numbers))}]; let y={key}; let s:String=x.iter().map(|n| char::from_u32((n^y) as u32).unwrap()).collect(); println!("{{}}",s); }}'
+    if language == "c":
+        if method == "hex": return f'#include <stdio.h>\n#include <stdlib.h>\nint main(void) {{ char s[]="{encoded}"; for(int i=0;s[i]&&s[i+1];i+=2) putchar((char)(strtol((char[]){{s[i],s[i+1],0}},0,16))); }}'
+        if method == "binary": return f'#include <stdio.h>\n#include <string.h>\nint main(void) {{ char s[]="{encoded}"; char *p=strtok(s," "); while(p) {{ int n=0; for(int i=0;p[i];i++) n=n*2+(p[i]-\'0\'); putchar(n); p=strtok(NULL," "); }} }}'
+        if method == "base64": return f'#include <stdio.h>\n#include <string.h>\nint main(void) {{ const char *s="{encoded}"; const char *abc="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; int val=0,bits=-8; for(size_t i=0;i<strlen(s);i++) {{ unsigned char c=s[i]; if(c==61) break; const char *p=strchr(abc,c); if(!p) continue; val=(val<<6)+(int)(p-abc); bits+=6; if(bits>=0) {{ putchar((val>>bits)&255); bits-=8; }} }} return 0; }}'
+        if method == "url": return f'#include <stdio.h>\n#include <stdlib.h>\nint main(void) {{ char s[]="{encoded}"; for(int i=0;s[i];i++) {{ if(s[i]==\'%\' && s[i+1] && s[i+2]) {{ printf("%c",(char)strtol((char[]){{s[i+1],s[i+2],0}},0,16)); i+=2; }} else putchar(s[i]); }} }}'
+        return f'#include <stdio.h>\nstatic void utf8(unsigned int c) {{ if(c<=0x7F) putchar(c); else if(c<=0x7FF) {{ putchar(0xC0|(c>>6)); putchar(0x80|(c&63)); }} else if(c<=0xFFFF && !(c>=0xD800 && c<=0xDFFF)) {{ putchar(0xE0|(c>>12)); putchar(0x80|((c>>6)&63)); putchar(0x80|(c&63)); }} else if(c<=0x10FFFF) {{ putchar(0xF0|(c>>18)); putchar(0x80|((c>>12)&63)); putchar(0x80|((c>>6)&63)); putchar(0x80|(c&63)); }} }}\nint main(void) {{ int X[]={{ {", ".join(map(str,numbers))} }}; int Y={key}; for(unsigned long i=0;i<sizeof(X)/sizeof(X[0]);i++) utf8((unsigned int)(X[i]^Y)); }}'
+    # C++ is handled above; C# above. Keep a safe explicit error for unknown identifiers.
+    raise ValueError("Этот язык пока не поддерживается")
+
+
 async def codec_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     data = query.data
+
+    menu_match = re.fullmatch(r"codec_languages_(url|base64|hex|binary|xor)_(\d+)", data or "")
+    if menu_match:
+        method, payload_id_text = menu_match.groups()
+        payload_id = int(payload_id_text)
+        payload = codec_python_payloads.get(payload_id)
+        if not payload or payload.get("user_id") != user_id or payload.get("method") != method:
+            await query.message.reply_text("Эта кнопка устарела или принадлежит другому пользователю.")
+            return
+        await query.edit_message_text("Выбери язык программирования для кода расшифровки:", reply_markup=language_keyboard(payload_id, method))
+        return
+
+    page_match = re.fullmatch(r"codec_langpage_(url|base64|hex|binary|xor)_(\d+)_(\d+)", data or "")
+    if page_match:
+        method, payload_id_text, page_text = page_match.groups()
+        payload_id, page = int(payload_id_text), int(page_text)
+        payload = codec_python_payloads.get(payload_id)
+        if not payload or payload.get("user_id") != user_id or payload.get("method") != method:
+            await query.message.reply_text("Эта кнопка устарела или принадлежит другому пользователю.")
+            return
+        await query.edit_message_reply_markup(reply_markup=language_keyboard(payload_id, method, page))
+        return
+
+    vars_match = re.fullmatch(r"codec_vars_(url|base64|hex|binary|xor)_([a-z]+)_(\d+)", data or "")
+    if vars_match:
+        method, language, payload_id_text = vars_match.groups()
+        payload_id = int(payload_id_text)
+        payload = codec_python_payloads.get(payload_id)
+        if not payload or payload.get("user_id") != user_id or payload.get("method") != method:
+            await query.message.reply_text("Эта кнопка устарела или принадлежит другому пользователю.")
+            return
+        codec_state[user_id] = {"action": "custom_vars", "method": method, "language": language, "payload_id": payload_id}
+        if method == "xor":
+            prompt = ("Отправь два имени переменных через запятую: сначала для массива закодированных чисел, "
+                      "затем для XOR-ключа. Например: encoded_values, secret_key")
+        else:
+            prompt = "Отправь имя переменной, в которой хранится закодированный текст. Например: encoded_text"
+        await query.message.reply_text(prompt)
+        return
+
+    lang_match = re.fullmatch(r"codec_lang_(url|base64|hex|binary|xor)_([a-z]+)_(\d+)", data or "")
+    if lang_match:
+        method, language, payload_id_text = lang_match.groups()
+        payload_id = int(payload_id_text)
+        payload = codec_python_payloads.get(payload_id)
+        if not payload or payload.get("user_id") != user_id or payload.get("method") != method:
+            await query.message.reply_text("Эта кнопка устарела или принадлежит другому пользователю.")
+            return
+        try:
+            code = language_decode_code(language, method, payload)
+        except ValueError:
+            await query.message.reply_text("Для этого языка пока нет готового генератора кода.")
+            return
+        language_info = next((item for item in CODEC_LANGUAGES if item[0] == language), None)
+        lang_label = language_info[1] if language_info else language
+        code_lang = {"python":"python", "cpp":"cpp", "csharp":"csharp", "java":"java", "javascript":"javascript", "typescript":"typescript", "go":"go", "php":"php", "ruby":"ruby", "rust":"rust", "kotlin":"kotlin", "swift":"swift", "c":"c"}.get(language, "text")
+        await query.message.reply_text(
+            f"Код расшифровки — {lang_label}:\n" + format_pre(code, code_lang),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "✏️ Настроить имена переменных",
+                callback_data=f"codec_vars_{method}_{language}_{payload_id}"
+            )]])
+        )
+        return
 
     if data == "codec_cancel":
         codec_state.pop(user_id, None)
@@ -1291,6 +1651,14 @@ def format_pre(text: str, language: str) -> str:
     return f'<pre><code class="language-{language}">{html.escape(text)}</code></pre>'
 
 
+def save_codec_python_payload(user_id: int, method: str, **payload_data) -> int:
+    payload_id = next(_codec_payload_counter)
+    codec_python_payloads[payload_id] = {"user_id": user_id, "method": method, **payload_data}
+    while len(codec_python_payloads) > 100:
+        codec_python_payloads.pop(min(codec_python_payloads))
+    return payload_id
+
+
 async def handle_codec_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Обрабатывает текстовый ввод активной операции кодирования/декодирования."""
     message = update.effective_message
@@ -1301,6 +1669,48 @@ async def handle_codec_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     value = message.text.strip()
     action, method, stage = state["action"], state["method"], state.get("stage", "text")
+
+    if action == "custom_vars":
+        parts = [part.strip() for part in value.split(",")]
+        expected = 2 if method == "xor" else 1
+        if len(parts) != expected or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) for part in parts):
+            example = "encoded_values, secret_key" if method == "xor" else "encoded_text"
+            await message.reply_text(
+                f"Нужно указать {'два' if expected == 2 else 'одно'} корректное имя переменной "
+                f"(латинские буквы, цифры и _, первый символ — буква или _). Пример: {example}"
+            )
+            return True
+        reserved_names = {
+            "class", "def", "return", "if", "else", "for", "while", "switch", "case",
+            "int", "float", "double", "char", "string", "void", "public", "private",
+            "static", "const", "let", "var", "new", "this", "function", "import",
+            "from", "as", "package", "func", "fn", "fun", "val", "var", "mut", "self",
+            "true", "false", "null", "None", "True", "False", "break", "continue",
+        }
+        if any(part in reserved_names for part in parts):
+            await message.reply_text("Это имя зарезервировано в одном или нескольких языках. Выбери другое.")
+            return True
+        if len(set(parts)) != len(parts):
+            await message.reply_text("Имена переменных должны отличаться друг от друга. Попробуй ещё раз.")
+            return True
+        payload_id = state["payload_id"]
+        payload = codec_python_payloads.get(payload_id)
+        if not payload or payload.get("user_id") != user_id or payload.get("method") != method:
+            codec_state.pop(user_id, None)
+            await message.reply_text("Эти данные устарели. Запусти /encode ещё раз.")
+            return True
+        try:
+            code = language_decode_code(state["language"], method, payload)
+            code = customize_decoder_variables(code, method, parts, state["language"])
+        except ValueError:
+            await message.reply_text("Не удалось подготовить код для этого языка.")
+            return True
+        codec_state.pop(user_id, None)
+        lang_info = next((item for item in CODEC_LANGUAGES if item[0] == state["language"]), None)
+        lang_label = lang_info[1] if lang_info else state["language"]
+        code_lang = {"python":"python", "cpp":"cpp", "csharp":"csharp", "java":"java", "javascript":"javascript", "typescript":"typescript", "go":"go", "php":"php", "ruby":"ruby", "rust":"rust", "kotlin":"kotlin", "swift":"swift", "c":"c"}.get(state["language"], "text")
+        await message.reply_text(f"Код расшифровки — {lang_label} (с твоими именами переменных):\n" + format_pre(code, code_lang), parse_mode="HTML")
+        return True
 
     if stage == "key":
         if not re.fullmatch(r"\d{1,5}", value) or int(value) > 65535:
@@ -1320,23 +1730,43 @@ async def handle_codec_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if action == "encode":
             if method == "url":
                 result = quote(value, safe="")
-                await message.reply_text(format_pre(result, "text"), parse_mode="HTML")
+                payload_id = save_codec_python_payload(user_id, method, encoded=result)
+                await message.reply_text(
+                    format_pre(result, "text"), parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧩 Выдать код расшифровки", callback_data=f"codec_languages_url_{payload_id}")]])
+                )
             elif method == "base64":
                 result = base64.b64encode(value.encode("utf-8")).decode("ascii")
-                await message.reply_text(format_pre(result, "text"), parse_mode="HTML")
+                payload_id = save_codec_python_payload(user_id, method, encoded=result)
+                await message.reply_text(
+                    format_pre(result, "text"), parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧩 Выдать код расшифровки", callback_data=f"codec_languages_base64_{payload_id}")]])
+                )
             elif method == "hex":
                 result = value.encode("utf-8").hex()
-                await message.reply_text(format_pre(result, "text"), parse_mode="HTML")
+                payload_id = save_codec_python_payload(user_id, method, encoded=result)
+                await message.reply_text(
+                    format_pre(result, "text"), parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧩 Выдать код расшифровки", callback_data=f"codec_languages_hex_{payload_id}")]])
+                )
             elif method == "binary":
                 result = " ".join(format(byte, "08b") for byte in value.encode("utf-8"))
-                await message.reply_text(format_pre(result, "text"), parse_mode="HTML")
+                payload_id = save_codec_python_payload(user_id, method, encoded=result)
+                await message.reply_text(
+                    format_pre(result, "text"), parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧩 Выдать код расшифровки", callback_data=f"codec_languages_binary_{payload_id}")]])
+                )
             elif method in ("xor", "xor_py"):
                 key = state["key"]
                 numbers = [ord(char) ^ key for char in value]
                 array = "X = [" + ", ".join(map(str, numbers)) + "]"
                 if method == "xor":
                     result = f"{array}\nY = {key}"
-                    await message.reply_text(format_pre(result, "xor"), parse_mode="HTML")
+                    payload_id = save_codec_python_payload(user_id, method, numbers=numbers, key=key)
+                    await message.reply_text(
+                        format_pre(result, "xor"), parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧩 Выдать код расшифровки", callback_data=f"codec_languages_xor_{payload_id}")]])
+                    )
                 else:
                     result = (
                         f"{array}\nY = {key}\n\n"
