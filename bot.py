@@ -10,6 +10,9 @@ import html
 import re
 from urllib.parse import quote, unquote
 
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+
 import aiohttp
 from telegram import (
     Update,
@@ -37,6 +40,10 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Ключ AES-256 должен содержать ровно 32 байта. Для реального использования
+# замени его на собственный секрет и не публикуй вместе с кодом.
+AES256_KEY = b"my_ultra_secret_key_32_bytes_lon"
 
 
 class LogSecurityExtension(logging.Filter):
@@ -667,18 +674,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(можно приложить фото/видео/стикер вместо текста)\n\n"
         "/id — узнать свой ID, выбрать пользователя/группу/канал для получения "
         "их ID, либо ответить на сообщение пользователя\n\n"
+        "/encode — кодирование: URL, Base64, Hex, бинарный формат, XOR и AES-256-CBC\n"
+        "/decode — декодирование этих форматов; для AES-256 нужны Hex-шифротекст и IV\n"
+        "После кодирования можно запросить код расшифровки на одном из 13 языков программирования.\n\n"
         "/convene Текст — здесь, в личке, выбери получателей (жми "
         "«Добавить получателей» сколько угодно раз, до 10 за раз, затем "
         "«Готово»). Также можно добавить человека по Telegram ID: "
         "ответь (reply) на сообщение бота с ID числом — и он добавится. "
         "Затем зайди в нужную группу и напиши там /send — сообщение с "
         "упоминаниями уйдёт туда.\n\n"
-        "/encode — кодирование текста (URL, Base64, Hex, бинарный формат, XOR). "
-        "После кодирования можно получить готовый код расшифровки на Python, "
-        "C++, C#, Java, JavaScript, TypeScript, Go, PHP, Ruby, Rust, Kotlin, "
-        "Swift или C; список языков разбит на страницы. Имена переменных в "
-        "коде можно настроить.\n"
-        "/decode — декодирование текста этими же способами.",
+        "Поддерживаются /encode и /decode, включая AES-256-CBC; после кодирования "
+        "можно получить код расшифровки на одном из 13 языков и настроить имена переменных.",
     )
 
 
@@ -1278,21 +1284,19 @@ CODEC_METHODS = {
     "hex": "Hex",
     "binary": "Бинарный",
     "xor": "XOR",
-    "xor_py": "XOR → Python-код",
+    "aes256": "AES-256",
 }
 
 
 def codec_keyboard(action: str) -> InlineKeyboardMarkup:
-    methods = ["url", "base64", "hex", "binary", "xor"]
-    if action == "encode":
-        methods.append("xor_py")
+    methods = ["url", "base64", "hex", "binary", "xor", "aes256"]
     labels = {
         "url": "🔗 URL",
         "base64": "🔐 Base64",
         "hex": "🔢 Hex",
         "binary": "💻 Бинарный",
         "xor": "⚡ XOR",
-        "xor_py": "🐍 XOR → Python-код",
+        "aes256": "🔒 AES-256",
     }
     rows = [[InlineKeyboardButton(labels[m], callback_data=f"codec_{action}_{m}")]
             for m in methods]
@@ -1451,6 +1455,9 @@ def customize_decoder_variables(code: str, method: str, names: list[str], langua
     if method == "xor":
         data_name, key_name = ("x", "y") if language in ("kotlin", "swift", "rust") else ("X", "Y")
         return rename_code_identifiers(code, {data_name: names[0], key_name: names[1]})
+    if method == "aes256":
+        data_alias = {"swift": "input", "go": "data", "rust": "data", "cpp": "input", "c": "input"}.get(language, "ciphertext")
+        return rename_code_identifiers(code, {data_alias: names[0], "iv": names[1]})
     # Different languages use different local names for the encoded input.
     aliases = {
         "python": "encoded", "javascript": "encoded", "typescript": "encoded",
@@ -1469,6 +1476,107 @@ def language_decode_code(language: str, method: str, payload: dict) -> str:
     encoded = payload.get("encoded", "")
     numbers = payload.get("numbers", [])
     key = payload.get("key", 0)
+    if method == "aes256":
+        cipher_hex = payload.get("encoded", "")
+        iv_hex = payload.get("iv", "")
+        key_hex = AES256_KEY.hex()
+        if language == "python":
+            return (
+                "from Crypto.Cipher import AES\nfrom Crypto.Util.Padding import unpad\n\n"
+                f"ciphertext = bytes.fromhex({cipher_hex!r})\n"
+                f"iv = bytes.fromhex({iv_hex!r})\n"
+                f"key = bytes.fromhex({key_hex!r})\n"
+                "plaintext = unpad(AES.new(key, AES.MODE_CBC, iv).decrypt(ciphertext), AES.block_size)\n"
+                "print(plaintext.decode('utf-8'))"
+            )
+        if language in ("javascript", "typescript"):
+            return (
+                "const crypto = require('crypto');\n"
+                f"const ciphertext = Buffer.from('{cipher_hex}', 'hex');\n"
+                f"const iv = Buffer.from('{iv_hex}', 'hex');\n"
+                f"const key = Buffer.from('{key_hex}', 'hex');\n"
+                "const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);\n"
+                "const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);\n"
+                "console.log(plaintext.toString('utf8'));"
+            )
+        if language in ("java", "kotlin"):
+            if language == "java":
+                return (
+                    "import javax.crypto.Cipher;\nimport javax.crypto.spec.IvParameterSpec;\nimport javax.crypto.spec.SecretKeySpec;\n"
+                    "import java.util.HexFormat;\nimport java.nio.charset.StandardCharsets;\n\n"
+                    "class Main { public static void main(String[] args) throws Exception {\n"
+                    f"byte[] ciphertext = HexFormat.of().parseHex(\"{cipher_hex}\");\n"
+                    f"byte[] iv = HexFormat.of().parseHex(\"{iv_hex}\");\n"
+                    f"byte[] key = HexFormat.of().parseHex(\"{key_hex}\");\n"
+                    "Cipher cipher = Cipher.getInstance(\"AES/CBC/PKCS5Padding\"); cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, \"AES\"), new IvParameterSpec(iv));\n"
+                    "System.out.println(new String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8));\n} }"
+                )
+            return (
+                "import javax.crypto.Cipher\nimport javax.crypto.spec.IvParameterSpec\nimport javax.crypto.spec.SecretKeySpec\n\n"
+                f"val ciphertext = \"{cipher_hex}\".chunked(2).map {{ it.toInt(16).toByte() }}.toByteArray()\n"
+                f"val iv = \"{iv_hex}\".chunked(2).map {{ it.toInt(16).toByte() }}.toByteArray()\n"
+                f"val key = \"{key_hex}\".chunked(2).map {{ it.toInt(16).toByte() }}.toByteArray()\n"
+                "val cipher = Cipher.getInstance(\"AES/CBC/PKCS5Padding\")\ncipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, \"AES\"), IvParameterSpec(iv))\n"
+                "println(String(cipher.doFinal(ciphertext), Charsets.UTF_8))"
+            )
+        if language == "csharp":
+            return (
+                "using System;\nusing System.Security.Cryptography;\nusing System.Text;\n\nclass Program { static void Main() {\n"
+                f"byte[] ciphertext = Convert.FromHexString(\"{cipher_hex}\");\n"
+                f"byte[] iv = Convert.FromHexString(\"{iv_hex}\");\n"
+                f"byte[] key = Convert.FromHexString(\"{key_hex}\");\n"
+                "using Aes aes = Aes.Create(); aes.Key = key; aes.IV = iv; aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;\n"
+                "using ICryptoTransform decryptor = aes.CreateDecryptor(); byte[] plain = decryptor.TransformFinalBlock(ciphertext, 0, ciphertext.Length);\n"
+                "Console.WriteLine(Encoding.UTF8.GetString(plain));\n} }"
+            )
+        if language == "go":
+            return (
+                "package main\nimport (\"crypto/aes\"; \"crypto/cipher\"; \"encoding/hex\"; \"fmt\")\nfunc main() {\n"
+                f"key, _ := hex.DecodeString(\"{key_hex}\"); iv, _ := hex.DecodeString(\"{iv_hex}\"); data, _ := hex.DecodeString(\"{cipher_hex}\")\n"
+                "block, _ := aes.NewCipher(key); cipher.NewCBCDecrypter(block, iv).CryptBlocks(data, data); pad := int(data[len(data)-1]); data = data[:len(data)-pad]; fmt.Println(string(data))\n}"
+            )
+        if language == "php":
+            return (
+                "<?php\n"
+                f"$ciphertext = hex2bin('{cipher_hex}'); $iv = hex2bin('{iv_hex}'); $key = hex2bin('{key_hex}');\n"
+                "$plaintext = openssl_decrypt($ciphertext, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv); echo $plaintext;\n?>"
+            )
+        if language == "ruby":
+            return (
+                "require 'openssl'\n"
+                f"ciphertext = ['{cipher_hex}'].pack('H*'); iv = ['{iv_hex}'].pack('H*'); key = ['{key_hex}'].pack('H*')\n"
+                "cipher = OpenSSL::Cipher.new('aes-256-cbc'); cipher.decrypt; cipher.key = key; cipher.iv = iv; puts (cipher.update(ciphertext) + cipher.final).force_encoding('UTF-8')"
+            )
+        if language == "rust":
+            return (
+                "// Cargo.toml: openssl = \"0.10\", hex = \"0.4\"\nuse openssl::symm::{decrypt, Cipher};\nfn main() {\n"
+                f"let key = hex::decode(\"{key_hex}\").unwrap(); let iv = hex::decode(\"{iv_hex}\").unwrap(); let data = hex::decode(\"{cipher_hex}\").unwrap();\n"
+                "let plain = decrypt(Cipher::aes_256_cbc(), &key, Some(&iv), &data).unwrap(); println!(\"{}\", String::from_utf8(plain).unwrap());\n}"
+            )
+        if language == "swift":
+            return (
+                "import Foundation\nimport CommonCrypto\n"
+                f"let key = Data(hex: \"{key_hex}\"); let iv = Data(hex: \"{iv_hex}\"); let input = Data(hex: \"{cipher_hex}\")\n"
+                "var output = [UInt8](repeating: 0, count: input.count + kCCBlockSizeAES128); let outputCount = output.count; var moved: size_t = 0\n"
+                "let status = output.withUnsafeMutableBytes { out in key.withUnsafeBytes { k in iv.withUnsafeBytes { v in input.withUnsafeBytes { d in CCCrypt(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(kCCOptionPKCS7Padding), k.baseAddress, key.count, v.baseAddress, d.baseAddress, input.count, out.baseAddress, outputCount, &moved) } } } }\n"
+                "if status == kCCSuccess { print(String(data: Data(output.prefix(moved)), encoding: .utf8) ?? \"\") }\n"
+                "extension Data { init(hex: String) { self.init((0..<hex.count).filter { $0 % 2 == 0 }.map { i in let a = hex.index(hex.startIndex, offsetBy: i); let b = hex.index(a, offsetBy: 2); return UInt8(hex[a..<b], radix: 16)! }) } }"
+            )
+        if language in ("cpp", "c"):
+            if language == "cpp":
+                return (
+                    "// Требуется OpenSSL (libcrypto).\n#include <openssl/evp.h>\n#include <cstdio>\n"
+                    "static int unhex(const char* s, unsigned char* out) { int n=0; while(s[0] && s[1]) { unsigned int x; std::sscanf(s, \"%2x\", &x); out[n++]=(unsigned char)x; s+=2; } return n; }\n"
+                    f"int main() {{ unsigned char key[32], iv[16], input[32768], output[32768]; unhex(\"{key_hex}\",key); unhex(\"{iv_hex}\",iv); int len=unhex(\"{cipher_hex}\",input);\n"
+                    "EVP_CIPHER_CTX* ctx=EVP_CIPHER_CTX_new(); int a=0,b=0; EVP_DecryptInit_ex(ctx,EVP_aes_256_cbc(),NULL,key,iv); EVP_DecryptUpdate(ctx,output,&a,input,len); EVP_DecryptFinal_ex(ctx,output+a,&b); std::fwrite(output,1,a+b,stdout); EVP_CIPHER_CTX_free(ctx); return 0; }"
+                )
+            return (
+                "/* Требуется OpenSSL (libcrypto). */\n#include <openssl/evp.h>\n#include <stdio.h>\n"
+                "static int unhex(const char* s, unsigned char* out) { int n=0; while(s[0] && s[1]) { unsigned int x; sscanf(s, \"%2x\", &x); out[n++]=(unsigned char)x; s+=2; } return n; }\n"
+                f"int main(void) {{ unsigned char key[32], iv[16], input[32768], output[32768]; unhex(\"{key_hex}\",key); unhex(\"{iv_hex}\",iv); int len=unhex(\"{cipher_hex}\",input);\n"
+                "EVP_CIPHER_CTX* ctx=EVP_CIPHER_CTX_new(); int a=0,b=0; EVP_DecryptInit_ex(ctx,EVP_aes_256_cbc(),NULL,key,iv); EVP_DecryptUpdate(ctx,output,&a,input,len); EVP_DecryptFinal_ex(ctx,output+a,&b); fwrite(output,1,a+b,stdout); EVP_CIPHER_CTX_free(ctx); return 0; }"
+            )
+        raise ValueError("Для этого языка пока не подготовлен AES-256-декодер")
     # Python is the reference implementation for every supported encoding.
     if language == "python":
         return python_decode_code(method, payload)
@@ -1555,7 +1663,7 @@ async def codec_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     user_id = query.from_user.id
     data = query.data
 
-    menu_match = re.fullmatch(r"codec_languages_(url|base64|hex|binary|xor)_(\d+)", data or "")
+    menu_match = re.fullmatch(r"codec_languages_(url|base64|hex|binary|xor|aes256)_(\d+)", data or "")
     if menu_match:
         method, payload_id_text = menu_match.groups()
         payload_id = int(payload_id_text)
@@ -1566,7 +1674,7 @@ async def codec_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("Выбери язык программирования для кода расшифровки:", reply_markup=language_keyboard(payload_id, method))
         return
 
-    page_match = re.fullmatch(r"codec_langpage_(url|base64|hex|binary|xor)_(\d+)_(\d+)", data or "")
+    page_match = re.fullmatch(r"codec_langpage_(url|base64|hex|binary|xor|aes256)_(\d+)_(\d+)", data or "")
     if page_match:
         method, payload_id_text, page_text = page_match.groups()
         payload_id, page = int(payload_id_text), int(page_text)
@@ -1577,7 +1685,7 @@ async def codec_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_reply_markup(reply_markup=language_keyboard(payload_id, method, page))
         return
 
-    vars_match = re.fullmatch(r"codec_vars_(url|base64|hex|binary|xor)_([a-z]+)_(\d+)", data or "")
+    vars_match = re.fullmatch(r"codec_vars_(url|base64|hex|binary|xor|aes256)_([a-z]+)_(\d+)", data or "")
     if vars_match:
         method, language, payload_id_text = vars_match.groups()
         payload_id = int(payload_id_text)
@@ -1586,15 +1694,15 @@ async def codec_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("Эта кнопка устарела или принадлежит другому пользователю.")
             return
         codec_state[user_id] = {"action": "custom_vars", "method": method, "language": language, "payload_id": payload_id}
-        if method == "xor":
-            prompt = ("Отправь два имени переменных через запятую: сначала для массива закодированных чисел, "
-                      "затем для XOR-ключа. Например: encoded_values, secret_key")
+        if method in ("xor", "aes256"):
+            prompt = (("Отправь два имени переменных через запятую: сначала для массива закодированных чисел, "
+                      "затем для XOR-ключа. Например: encoded_values, secret_key") if method == "xor" else "Отправь два имени переменных через запятую: сначала для зашифрованного текста, затем для IV. Например: ciphertext_hex, iv_hex")
         else:
             prompt = "Отправь имя переменной, в которой хранится закодированный текст. Например: encoded_text"
         await query.message.reply_text(prompt)
         return
 
-    lang_match = re.fullmatch(r"codec_lang_(url|base64|hex|binary|xor)_([a-z]+)_(\d+)", data or "")
+    lang_match = re.fullmatch(r"codec_lang_(url|base64|hex|binary|xor|aes256)_([a-z]+)_(\d+)", data or "")
     if lang_match:
         method, language, payload_id_text = lang_match.groups()
         payload_id = int(payload_id_text)
@@ -1625,13 +1733,13 @@ async def codec_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("Операция отменена.")
         return
 
-    match = re.fullmatch(r"codec_(encode|decode)_([a-z]+)", data or "")
+    match = re.fullmatch(r"codec_(encode|decode)_([a-z0-9]+)", data or "")
     if not match:
         return
     action, method = match.groups()
     codec_state[user_id] = {"action": action, "method": method}
 
-    if method in ("xor", "xor_py") and action == "encode":
+    if method == "xor" and action == "encode":
         codec_state[user_id]["stage"] = "key"
         await query.edit_message_text(
             "Введи числовой XOR-ключ (например, 162). Ключ будет отдельно от текста."
@@ -1643,7 +1751,10 @@ async def codec_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
     else:
         codec_state[user_id]["stage"] = "text"
-        prompt = "Отправь текст для кодирования." if action == "encode" else "Отправь закодированный текст."
+        if method == "aes256" and action == "decode":
+            prompt = "Отправь Hex-строку зашифрованного текста. Затем бот запросит IV."
+        else:
+            prompt = "Отправь текст для кодирования." if action == "encode" else "Отправь закодированный текст."
         await query.edit_message_text(prompt)
 
 
@@ -1672,9 +1783,9 @@ async def handle_codec_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if action == "custom_vars":
         parts = [part.strip() for part in value.split(",")]
-        expected = 2 if method == "xor" else 1
+        expected = 2 if method in ("xor", "aes256") else 1
         if len(parts) != expected or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) for part in parts):
-            example = "encoded_values, secret_key" if method == "xor" else "encoded_text"
+            example = "encoded_values, secret_key" if method == "xor" else ("ciphertext_hex, iv_hex" if method == "aes256" else "encoded_text")
             await message.reply_text(
                 f"Нужно указать {'два' if expected == 2 else 'одно'} корректное имя переменной "
                 f"(латинские буквы, цифры и _, первый символ — буква или _). Пример: {example}"
@@ -1726,6 +1837,32 @@ async def handle_codec_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text(prompt)
         return True
 
+    if action == "decode" and method == "aes256" and stage == "text":
+        try:
+            bytes.fromhex(value)
+        except ValueError:
+            await message.reply_text("Нужна корректная Hex-строка зашифрованного текста.")
+            return True
+        state["ciphertext_hex"] = value
+        state["stage"] = "iv"
+        await message.reply_text("Теперь отправь IV в Hex (32 шестнадцатеричных символа).")
+        return True
+    if action == "decode" and method == "aes256" and stage == "iv":
+        try:
+            iv = bytes.fromhex(value)
+            ciphertext = bytes.fromhex(state["ciphertext_hex"])
+            if len(iv) != 16 or not ciphertext or len(ciphertext) % AES.block_size:
+                raise ValueError("IV должен быть 16 байт, а шифротекст — кратен размеру блока AES.")
+            plain = unpad(AES.new(AES256_KEY, AES.MODE_CBC, iv).decrypt(ciphertext), AES.block_size)
+            result = plain.decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            await message.reply_text(f"Не удалось расшифровать AES-256: {html.escape(str(exc))}")
+            codec_state.pop(user_id, None)
+            return True
+        codec_state.pop(user_id, None)
+        await message.reply_text(result)
+        return True
+
     try:
         if action == "encode":
             if method == "url":
@@ -1756,7 +1893,22 @@ async def handle_codec_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     format_pre(result, "text"), parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧩 Выдать код расшифровки", callback_data=f"codec_languages_binary_{payload_id}")]])
                 )
-            elif method in ("xor", "xor_py"):
+            elif method == "aes256":
+                if len(AES256_KEY) != 32:
+                    raise ValueError("Ключ AES-256 должен содержать 32 байта.")
+                iv = os.urandom(16)
+                cipher = AES.new(AES256_KEY, AES.MODE_CBC, iv)
+                ciphertext = cipher.encrypt(pad(value.encode("utf-8"), AES.block_size))
+                result = ciphertext.hex()
+                iv_hex = iv.hex()
+                payload_id = save_codec_python_payload(user_id, method, encoded=result, iv=iv_hex)
+                await message.reply_text(
+                    "AES-256-CBC — зашифрованный текст (Hex):\n" + format_pre(result, "text") +
+                    "\nIV (Hex):\n" + format_pre(iv_hex, "text"),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧩 Выдать код расшифровки", callback_data=f"codec_languages_aes256_{payload_id}")]])
+                )
+            elif method == "xor":
                 key = state["key"]
                 numbers = [ord(char) ^ key for char in value]
                 array = "X = [" + ", ".join(map(str, numbers)) + "]"
@@ -1767,14 +1919,6 @@ async def handle_codec_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         format_pre(result, "xor"), parse_mode="HTML",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧩 Выдать код расшифровки", callback_data=f"codec_languages_xor_{payload_id}")]])
                     )
-                else:
-                    result = (
-                        f"{array}\nY = {key}\n\n"
-                        "def decode():\n"
-                        "    return \"\".join(chr(n ^ Y) for n in X)\n\n"
-                        "print(decode())"
-                    )
-                    await message.reply_text(format_pre(result, "python"), parse_mode="HTML")
         else:
             if method == "url":
                 result = unquote(value, encoding="utf-8", errors="strict")
@@ -1787,6 +1931,8 @@ async def handle_codec_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 if not bits or re.sub(r"[01\s]", "", value):
                     raise ValueError("Ожидаются байты по 8 бит, разделённые пробелами.")
                 result = bytes(int(bit, 2) for bit in bits).decode("utf-8")
+            elif method == "aes256":
+                raise ValueError("Для AES-256 нужно отправить шифротекст и IV отдельно.")
             elif method == "xor":
                 nums = [int(n) for n in re.findall(r"-?\d+", value)]
                 if not nums:
